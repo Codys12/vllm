@@ -38,6 +38,13 @@ class ModelConfig:
             will use FP16 precision for FP32 and FP16 models, and BF16 precision
             for BF16 models.
         seed: Random seed for reproducibility.
+        revision: The specific model version to use. It can be a branch name,
+            a tag name, or a commit id. If unspecified, will use the default
+            version.
+        max_model_len: Maximum length of a sequence (including prompt and
+            output). If None, will be derived from the model.
+        quantization: Quantization method that was used to quantize the model
+            weights. If None, we assume the model weights are not quantized.
     """
 
     def __init__(
@@ -50,6 +57,9 @@ class ModelConfig:
         load_format: str,
         dtype: str,
         seed: int,
+        revision: Optional[str],
+        max_model_len: Optional[int] = None,
+        quantization: Optional[str] = None,
     ) -> None:
         self.model = model
         self.tokenizer = tokenizer
@@ -58,11 +68,24 @@ class ModelConfig:
         self.download_dir = download_dir
         self.load_format = load_format
         self.seed = seed
+        self.revision = revision
+        self.quantization = quantization
 
-        self.hf_config = get_config(model, trust_remote_code)
+        self.hf_config = get_config(model, trust_remote_code, revision)
         self.dtype = _get_and_verify_dtype(self.hf_config, dtype)
         self._verify_load_format()
         self._verify_tokenizer_mode()
+        self._verify_quantization()
+        self.max_model_len = None
+        if max_model_len is not None:
+            derived_max_model_len = self.get_max_model_len()
+            if max_model_len > derived_max_model_len:
+                logger.warning(
+                    f"User-specified max_model_len ({max_model_len}) is "
+                    f"greater than the derived max_model_len "
+                    f"({derived_max_model_len}). Make sure the value is "
+                    "correct and within the model context size.")
+        self.max_model_len = max_model_len
 
     def _verify_load_format(self) -> None:
         load_format = self.load_format.lower()
@@ -81,6 +104,17 @@ class ModelConfig:
                 f"Unknown tokenizer mode: {self.tokenizer_mode}. Must be "
                 "either 'auto' or 'slow'.")
         self.tokenizer_mode = tokenizer_mode
+
+    def _verify_quantization(self) -> None:
+        supported_quantization = ["awq"]
+        if self.quantization is None:
+            return
+        quantization = self.quantization.lower()
+        if quantization not in supported_quantization:
+            raise ValueError(
+                f"Unknown quantization: {self.quantization}. Must be one of "
+                f"{supported_quantization}.")
+        self.quantization = quantization
 
     def verify_with_parallel_config(
         self,
@@ -114,8 +148,9 @@ class ModelConfig:
         # Note: for falcon, when new_decoder_architecture is True, the
         # multi_query flag is ignored and we use n_head_kv for the number of
         # KV heads.
+        falcon_model_types = ["falcon", "RefinedWeb", "RefinedWebModel"]
         new_decoder_arch_falcon = (
-            self.hf_config.model_type == "falcon"
+            self.hf_config.model_type in falcon_model_types
             and getattr(self.hf_config, "new_decoder_architecture", False))
         if not new_decoder_arch_falcon and getattr(self.hf_config,
                                                    "multi_query", False):
@@ -133,6 +168,8 @@ class ModelConfig:
         return total_num_attention_heads // parallel_config.tensor_parallel_size
 
     def get_max_model_len(self) -> int:
+        if self.max_model_len is not None:
+            return self.max_model_len
         max_model_len = float("inf")
         possible_keys = [
             # OPT

@@ -242,11 +242,13 @@ class AsyncLLMEngine:
                  engine_use_ray: bool,
                  *args,
                  log_requests: bool = True,
+                 max_log_len: Optional[int] = None,
                  start_engine_loop: bool = True,
                  **kwargs) -> None:
         self.worker_use_ray = worker_use_ray
         self.engine_use_ray = engine_use_ray
         self.log_requests = log_requests
+        self.max_log_len = max_log_len
         self.engine = self._init_engine(*args, **kwargs)
 
         self.request_tracker: RequestTracker = RequestTracker()
@@ -325,10 +327,18 @@ class AsyncLLMEngine:
         arrival_time: Optional[float] = None,
     ) -> AsyncStream:
         if self.log_requests:
+            shortened_prompt = prompt
+            shortened_token_ids = prompt_token_ids
+            if self.max_log_len is not None:
+                if shortened_prompt is not None:
+                    shortened_prompt = shortened_prompt[:self.max_log_len]
+                if shortened_token_ids is not None:
+                    shortened_token_ids = shortened_token_ids[:self.
+                                                              max_log_len]
             logger.info(f"Received request {request_id}: "
-                        f"prompt: {prompt!r}, "
+                        f"prompt: {shortened_prompt!r}, "
                         f"sampling params: {sampling_params}, "
-                        f"prompt token ids: {prompt_token_ids}.")
+                        f"prompt token ids: {shortened_token_ids}.")
 
         if not self.is_running:
             if self.start_engine_loop:
@@ -385,8 +395,9 @@ class AsyncLLMEngine:
 
             async for request_output in stream:
                 yield request_output
-        except Exception as e:
-            # If there is an exception, abort the request.
+        except (Exception, asyncio.CancelledError) as e:
+            # If there is an exception or coroutine is cancelled, abort the
+            # request.
             self._abort(request_id)
             raise e
 
@@ -446,5 +457,6 @@ class AsyncLLMEngine:
                      placement_group,
                      log_requests=not engine_args.disable_log_requests,
                      log_stats=not engine_args.disable_log_stats,
+                     max_log_len=engine_args.max_log_len,
                      start_engine_loop=start_engine_loop)
         return engine
