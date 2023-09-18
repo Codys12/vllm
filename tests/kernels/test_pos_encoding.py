@@ -66,8 +66,8 @@ class RefRotaryEmbedding(nn.Module):
             emb = torch.cat((freqs, freqs), dim=-1)
         else:
             emb = torch.repeat_interleave(freqs, 2, -1)
-        cos = emb.cos().to(dtype=inv_freq.dtype)
-        sin = emb.sin().to(dtype=inv_freq.dtype)
+        cos = emb.cos()
+        sin = emb.sin()
         self.register_buffer("cos_cached", cos, persistent=False)
         self.register_buffer("sin_cached", sin, persistent=False)
 
@@ -161,7 +161,7 @@ def test_rotary_embedding(
         is_neox_style=is_neox_style,
         max_position_embeddings=max_position,
         base=base,
-    ).to(dtype=dtype, device="cuda")
+    ).to(device="cuda")
     ref_query, ref_key = ref_rotary_embedding(
         positions,
         query.view(num_tokens, num_heads, head_size),
