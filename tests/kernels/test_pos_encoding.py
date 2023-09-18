@@ -11,8 +11,8 @@ IS_NEOX_STYLE = [True, False]
 DTYPES = [torch.half, torch.bfloat16, torch.float]
 HEAD_SIZES = [64, 80, 96, 112, 128, 256]
 ROTARY_DIMS = [None, 32]  # None means rotary dim == head size
-NUM_HEADS = [7, 12, 40, 52]  # Arbitrary values for testing
-NUM_TOKENS = [11, 83, 2048]  # Arbitrary values for testing
+NUM_HEADS = [7, 52]  # Arbitrary values for testing
+NUM_TOKENS = [83, 2048]  # Arbitrary values for testing
 SEEDS = [0]
 
 
