@@ -47,20 +47,20 @@ class RefRotaryEmbedding(nn.Module):
 
     def __init__(
         self,
-        dim: int,
+        rotary_dim: int,
         is_neox_style: bool,
         max_position_embeddings: int = 8192,
         base: int = 10000,
     ) -> None:
         super().__init__()
-        self.rotary_dim = dim
+        self.rotary_dim = rotary_dim
         self.is_neox_style = is_neox_style
         self.max_position_embeddings = max_position_embeddings
 
         # Create cos and sin embeddings.
-        inv_freq = 1.0 / (base**(torch.arange(0, dim, 2) / dim))
-        t = torch.arange(max_position_embeddings).float()
-        freqs = torch.einsum("i,j->ij", t, inv_freq.float())
+        inv_freq = 1.0 / (base**(torch.arange(0, dim, 2, dtype=torch.float) / rotary_dim))
+        t = torch.arange(max_position_embeddings, dtype=torch.float)
+        freqs = torch.einsum("i,j->ij", t, inv_freq)
         if is_neox_style:
             emb = torch.cat((freqs, freqs), dim=-1)
         else:
@@ -81,15 +81,15 @@ class RefRotaryEmbedding(nn.Module):
         key_rot = key[..., :self.rotary_dim]
         key_pass = key[..., self.rotary_dim:]
 
-        query_rot = query_rot.transpose(0, 1)
-        key_rot = key_rot.transpose(0, 1)
+        query_rot = query_rot.transpose(0, 1).float()
+        key_rot = key_rot.transpose(0, 1).float()
         cos = F.embedding(positions, self.cos_cached)
         sin = F.embedding(positions, self.sin_cached)
 
         query_rot, key_rot = apply_rope(query_rot, key_rot, cos, sin,
                                         self.is_neox_style)
-        query_rot = query_rot.transpose(0, 1).contiguous()
-        key_rot = key_rot.transpose(0, 1).contiguous()
+        query_rot = query_rot.transpose(0, 1).contiguous().to(query_pass.dtype)
+        key_rot = key_rot.transpose(0, 1).contiguous().to(key_pass.dtype)
 
         query = torch.cat((query_rot, query_pass), dim=-1)
         key = torch.cat((key_rot, key_pass), dim=-1)
@@ -135,12 +135,12 @@ def test_rotary_embedding(
     # Create the rotary embedding.
     inv_freq = 1.0 / (base**(
         torch.arange(0, rotary_dim, 2, dtype=torch.float) / rotary_dim))
-    t = torch.arange(max_position).float()
+    t = torch.arange(max_position, dtype=torch.float)
     freqs = torch.einsum("i,j -> ij", t, inv_freq)
     cos = freqs.cos()
     sin = freqs.sin()
     cos_sin_cache = torch.cat((cos, sin), dim=-1)
-    cos_sin_cache = cos_sin_cache.to(dtype=dtype, device='cuda')
+    cos_sin_cache = cos_sin_cache.to(device='cuda')
 
     # Run the kernel. The kernel is in-place, so we need to clone the inputs.
     out_query = query.clone()
@@ -156,7 +156,7 @@ def test_rotary_embedding(
 
     # Run the reference implementation.
     ref_rotary_embedding = RefRotaryEmbedding(
-        dim=rotary_dim,
+        rotary_dim=rotary_dim,
         is_neox_style=is_neox_style,
         max_position_embeddings=max_position,
         base=base,
