@@ -58,7 +58,8 @@ class RefRotaryEmbedding(nn.Module):
         self.max_position_embeddings = max_position_embeddings
 
         # Create cos and sin embeddings.
-        inv_freq = 1.0 / (base**(torch.arange(0, dim, 2, dtype=torch.float) / rotary_dim))
+        inv_freq = 1.0 / (base**(
+            torch.arange(0, rotary_dim, 2, dtype=torch.float) / rotary_dim))
         t = torch.arange(max_position_embeddings, dtype=torch.float)
         freqs = torch.einsum("i,j->ij", t, inv_freq)
         if is_neox_style:
