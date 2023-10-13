@@ -29,6 +29,8 @@ class InputMetadata:
         context_lens: torch.Tensor,
         max_context_len: int,
         block_tables: torch.Tensor,
+        seq_indices: torch.Tensor,
+        cumulative_num_partitions: torch.Tensor,
         sliding_window: Optional[int] = None,
     ) -> None:
         self.seq_groups = seq_groups
@@ -38,6 +40,8 @@ class InputMetadata:
         self.context_lens = context_lens
         self.max_context_len = max_context_len
         self.block_tables = block_tables
+        self.seq_indices = seq_indices
+        self.cumulative_num_partitions = cumulative_num_partitions
 
         self.to_cache = None
         if sliding_window is not None:

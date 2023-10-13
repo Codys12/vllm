@@ -15,6 +15,8 @@ from vllm.sequence import SamplerOutput, SequenceData, SequenceGroupMetadata
 from vllm.worker.cache_engine import CacheEngine
 from vllm.utils import get_gpu_memory, get_max_shared_memory_bytes
 
+_PARTITION_SIZE = 512
+
 
 class Worker:
     """A worker class that executes (a partition of) the model on a GPU.
@@ -267,6 +269,26 @@ class Worker:
                                            dtype=torch.int,
                                            device="cuda")
 
+        if self.block_size is not None:
+            assert _PARTITION_SIZE % self.block_size == 0
+        num_partitions_per_seq = [
+            (context_len + _PARTITION_SIZE - 1) // _PARTITION_SIZE
+            for context_len in context_lens
+        ]
+        seq_indices: List[int] = []
+        cumulative_num_partitions: List[int] = [0]
+        for i, num_partitions in enumerate(num_partitions_per_seq):
+            seq_indices.extend([i] * num_partitions)
+            cumulative_num_partitions.append(
+                cumulative_num_partitions[-1] + num_partitions)
+        seq_indices_tensor = torch.tensor(
+            seq_indices, dtype=torch.int32, device="cuda")
+        cumulative_num_partitions_tensor = torch.tensor(
+            cumulative_num_partitions,
+            dtype=torch.int32,
+            device="cuda",
+        )
+
         seq_data: Dict[int, SequenceData] = {}
         for seq_group_metadata in seq_group_metadata_list:
             seq_data.update(seq_group_metadata.seq_data)
@@ -279,6 +301,8 @@ class Worker:
             context_lens=context_lens_tensor,
             max_context_len=max_context_len,
             block_tables=block_tables_tensor,
+            seq_indices=seq_indices_tensor,
+            cumulative_num_partitions=cumulative_num_partitions_tensor,
             sliding_window=self.sliding_window,
         )
         return tokens_tensor, positions_tensor, input_metadata

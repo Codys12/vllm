@@ -16,6 +16,9 @@ void paged_attention_v1(
 
 void paged_attention_v2(
   torch::Tensor& out,
+  torch::Tensor& seq_indices,
+  torch::Tensor& partition_indices,
+  torch::Tensor& cumulative_num_partitions,
   torch::Tensor& exp_sums,
   torch::Tensor& max_logits,
   torch::Tensor& tmp_out,

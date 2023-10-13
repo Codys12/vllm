@@ -66,8 +66,7 @@ inline __device__ float block_sum(float* red_smem, float sum) {
   return __shfl_sync(uint32_t(-1), sum, 0);
 }
 
-// TODO(woosuk): Merge the last two dimensions of the grid.
-// Grid: (num_heads, num_seqs, max_num_partitions).
+// Grid: (num_heads, num_seq_partitions).
 template<
   typename scalar_t,
   int HEAD_SIZE,
@@ -75,9 +74,11 @@ template<
   int NUM_THREADS,
   int PARTITION_SIZE = 0> // Zero means no partitioning.
 __device__ void paged_attention_kernel(
-  float* __restrict__ exp_sums,           // [num_seqs, num_heads, max_num_partitions]
-  float* __restrict__ max_logits,         // [num_seqs, num_heads, max_num_partitions]
-  scalar_t* __restrict__ out,             // [num_seqs, num_heads, max_num_partitions, head_size]
+  const int* __restrict__ seq_indices,    // [num_seq_partitions]
+  const int* __restrict__ partition_indices, // [num_seq_partitions]
+  float* __restrict__ exp_sums,           // [num_heads, num_seq_partitions]
+  float* __restrict__ max_logits,         // [num_heads, num_seq_partitions]
+  scalar_t* __restrict__ out,             // [num_seq_partitions, num_heads, head_size]
   const scalar_t* __restrict__ q,         // [num_seqs, num_heads, head_size]
   const scalar_t* __restrict__ k_cache,   // [num_blocks, num_kv_heads, head_size/x, block_size, x]
   const scalar_t* __restrict__ v_cache,   // [num_blocks, num_kv_heads, head_size, block_size]
@@ -90,23 +91,38 @@ __device__ void paged_attention_kernel(
   const int q_stride,
   const int kv_block_stride,
   const int kv_head_stride) {
-  // FIXME(woosuk): Optimize.
-  const int seq_idx = blockIdx.y;
-  const int partition_idx = blockIdx.z;
-  const int max_num_partitions = gridDim.z;
+  const int thread_idx = threadIdx.x;
+  const int warp_idx = thread_idx / WARP_SIZE;
+  const int lane = thread_idx % WARP_SIZE;
+
   constexpr bool USE_PARTITIONING = PARTITION_SIZE > 0;
+  const int num_global_partitions = gridDim.y;
+  const int global_partition_idx = blockIdx.y;
+  int seq_idx;
+  int seq_partition_idx;
+  __shared__ int tmp_seq_idx;
+  __shared__ int tmp_seq_partition_idx;
+  if (USE_PARTITIONING) {
+    if (thread_idx == 0) {
+      tmp_seq_idx = seq_indices[global_partition_idx];
+      tmp_seq_partition_idx = partition_indices[global_partition_idx];
+    }
+    __syncthreads();
+    seq_idx = tmp_seq_idx;
+    seq_partition_idx = tmp_seq_partition_idx;
+  } else {
+    seq_idx = blockIdx.y;
+    seq_partition_idx = 0;
+  }
+
   const int context_len = context_lens[seq_idx];
   const int num_context_blocks = DIVIDE_ROUND_UP(context_len, BLOCK_SIZE);
   const int num_blocks_per_partition = USE_PARTITIONING ? PARTITION_SIZE / BLOCK_SIZE : num_context_blocks;
 
   // [start_block_idx, end_block_idx) is the range of blocks to process.
-  const int start_block_idx = USE_PARTITIONING ? partition_idx * num_blocks_per_partition : 0;
+  const int start_block_idx = USE_PARTITIONING ? seq_partition_idx * num_blocks_per_partition : 0;
   int end_block_idx = MIN(start_block_idx + num_blocks_per_partition, num_context_blocks);
   int num_blocks = end_block_idx - start_block_idx;
-  if (num_blocks <= 0) {
-    // No work to do. Terminate the thread block.
-    return;
-  }
 
   // [start_token_idx, end_token_idx) is the range of tokens to process.
   int start_token_idx = start_block_idx * BLOCK_SIZE;
@@ -118,9 +134,6 @@ __device__ void paged_attention_kernel(
   assert(NUM_THREADS % THREAD_GROUP_SIZE == 0);
   constexpr int NUM_TOKENS_PER_THREAD_GROUP = DIVIDE_ROUND_UP(BLOCK_SIZE, WARP_SIZE);
   constexpr int NUM_WARPS = NUM_THREADS / WARP_SIZE;
-  const int thread_idx = threadIdx.x;
-  const int warp_idx = thread_idx / WARP_SIZE;
-  const int lane = thread_idx % WARP_SIZE;
 
   const int head_idx = blockIdx.x;
   const int num_heads = gridDim.x;
@@ -248,14 +261,10 @@ __device__ void paged_attention_kernel(
 
   // If partitioning is enabled, store the max logit and exp_sum.
   if (USE_PARTITIONING && thread_idx == 0) {
-    float* max_logits_ptr = max_logits + seq_idx * num_heads * max_num_partitions
-                                       + head_idx * max_num_partitions
-                                       + partition_idx;
-    *max_logits_ptr = qk_max;
-    float* exp_sums_ptr = exp_sums + seq_idx * num_heads * max_num_partitions
-                                   + head_idx * max_num_partitions
-                                   + partition_idx;
-    *exp_sums_ptr = exp_sum;
+    float* max_logits_ptr = max_logits + head_idx * num_global_partitions;
+    max_logits_ptr[global_partition_idx] = qk_max;
+    float* exp_sums_ptr = exp_sums + head_idx * num_global_partitions;
+    exp_sums_ptr[global_partition_idx] = exp_sum;
   }
 
   // Compute softmax.
@@ -363,9 +372,8 @@ __device__ void paged_attention_kernel(
 
   // Write the final output.
   if (warp_idx == 0) {
-    scalar_t* out_ptr = out + seq_idx * num_heads * max_num_partitions * HEAD_SIZE
-                            + head_idx * max_num_partitions * HEAD_SIZE
-                            + partition_idx * HEAD_SIZE;
+    scalar_t* out_ptr = out + global_partition_idx * num_heads * HEAD_SIZE
+                            + head_idx * HEAD_SIZE;
 #pragma unroll
     for (int i = 0; i < NUM_ROWS_PER_THREAD; i++) {
       const int row_idx = lane / NUM_V_VECS_PER_ROW + i * NUM_ROWS_PER_ITER;
@@ -376,7 +384,7 @@ __device__ void paged_attention_kernel(
   }
 }
 
-// Grid: (num_heads, num_seqs, 1).
+// Grid: (num_heads, num_seqs).
 template<
   typename scalar_t,
   int HEAD_SIZE,
@@ -397,12 +405,13 @@ __global__ void paged_attention_v1_kernel(
   const int kv_block_stride,
   const int kv_head_stride) {
   paged_attention_kernel<scalar_t, HEAD_SIZE, BLOCK_SIZE, NUM_THREADS>(
+    /* seq_indices */ nullptr, /* partition_indices */ nullptr,
     /* exp_sums */ nullptr, /* max_logits */ nullptr,
     out, q, k_cache, v_cache, head_mapping, scale, block_tables, context_lens,
     max_num_blocks_per_seq, alibi_slopes, q_stride, kv_block_stride, kv_head_stride);
 }
 
-// Grid: (num_heads, num_seqs, max_num_partitions).
+// Grid: (num_heads, num_seq_partitions).
 template<
   typename scalar_t,
   int HEAD_SIZE,
@@ -410,9 +419,11 @@ template<
   int NUM_THREADS,
   int PARTITION_SIZE>
 __global__ void paged_attention_v2_kernel(
-  float* __restrict__ exp_sums,           // [num_seqs, num_heads, max_num_partitions]
-  float* __restrict__ max_logits,         // [num_seqs, num_heads, max_num_partitions]
-  scalar_t* __restrict__ tmp_out,         // [num_seqs, num_heads, max_num_partitions, head_size]
+  const int* __restrict__ seq_indices,    // [num_seq_partitions]
+  const int* __restrict__ partition_indices, // [num_seq_partitions]
+  float* __restrict__ exp_sums,           // [num_heads, num_seq_partitions]
+  float* __restrict__ max_logits,         // [num_heads, num_seq_partitions]
+  scalar_t* __restrict__ tmp_out,         // [num_seq_partitions, num_heads, head_size]
   const scalar_t* __restrict__ q,         // [num_seqs, num_heads, head_size]
   const scalar_t* __restrict__ k_cache,   // [num_blocks, num_kv_heads, head_size/x, block_size, x]
   const scalar_t* __restrict__ v_cache,   // [num_blocks, num_kv_heads, head_size, block_size]
@@ -426,9 +437,9 @@ __global__ void paged_attention_v2_kernel(
   const int kv_block_stride,
   const int kv_head_stride) {
   paged_attention_kernel<scalar_t, HEAD_SIZE, BLOCK_SIZE, NUM_THREADS, PARTITION_SIZE>(
-    exp_sums, max_logits, tmp_out, q, k_cache, v_cache, head_mapping, scale,
-    block_tables, context_lens, max_num_blocks_per_seq, alibi_slopes,
-    q_stride, kv_block_stride, kv_head_stride);
+    seq_indices, partition_indices, exp_sums, max_logits, tmp_out,
+    q, k_cache, v_cache, head_mapping, scale, block_tables, context_lens,
+    max_num_blocks_per_seq, alibi_slopes, q_stride, kv_block_stride, kv_head_stride);
 }
 
 // Grid: (num_heads, num_seqs).
@@ -439,21 +450,25 @@ template<
   int PARTITION_SIZE>
 __global__ void paged_attention_v2_reduce_kernel(
   scalar_t* __restrict__ out,             // [num_seqs, num_heads, head_size]
-  const float* __restrict__ exp_sums,     // [num_seqs, num_heads, max_num_partitions]
-  const float* __restrict__ max_logits,   // [num_seqs, num_heads, max_num_partitions]
-  const scalar_t* __restrict__ tmp_out,   // [num_seqs, num_heads, max_num_partitions, head_size]
-  const int* __restrict__ context_lens,   // [num_seqs]
-  const int max_num_partitions) {
+  const int* __restrict__ cumulative_num_partitions, // [num_seqs + 1]
+  const float* __restrict__ exp_sums,     // [num_heads, num_seq_partitions]
+  const float* __restrict__ max_logits,   // [num_heads, num_seq_partitions]
+  const scalar_t* __restrict__ tmp_out,   // [num_seq_partitions, num_heads, head_size]
+  const int num_seq_partitions)
+{
   const int num_heads = gridDim.x;
   const int head_idx = blockIdx.x;
   const int seq_idx = blockIdx.y;
-  const int context_len = context_lens[seq_idx];
-  const int num_partitions = DIVIDE_ROUND_UP(context_len, PARTITION_SIZE);
+  // [start_partition_idx, end_partition_idx) is the range of partitions.
+  const int start_partition_idx = cumulative_num_partitions[seq_idx];
+  const int end_partition_idx = cumulative_num_partitions[seq_idx + 1];
+  const int num_partitions = end_partition_idx - start_partition_idx;
+
   if (num_partitions == 1) {
     // No need to reduce. Only copy tmp_out to out.
     scalar_t* out_ptr = out + seq_idx * num_heads * HEAD_SIZE + head_idx * HEAD_SIZE;
-    const scalar_t* tmp_out_ptr = tmp_out + seq_idx * num_heads * max_num_partitions * HEAD_SIZE
-                                          + head_idx * max_num_partitions * HEAD_SIZE;
+    const scalar_t* tmp_out_ptr = tmp_out + start_partition_idx * num_heads * HEAD_SIZE
+                                          + head_idx * HEAD_SIZE;
     for (int i = threadIdx.x; i < HEAD_SIZE; i += blockDim.x) {
       out_ptr[i] = tmp_out_ptr[i];
     }
@@ -472,8 +487,7 @@ __global__ void paged_attention_v2_reduce_kernel(
 
   // Load max logits to shared memory.
   float* shared_max_logits = reinterpret_cast<float*>(shared_mem);
-  const float* max_logits_ptr = max_logits + seq_idx * num_heads * max_num_partitions
-                                           + head_idx * max_num_partitions;
+  const float* max_logits_ptr = max_logits + head_idx * num_seq_partitions + start_partition_idx;
   float max_logit = -FLT_MAX;
   for (int i = threadIdx.x; i < num_partitions; i += blockDim.x) {
     const float l = max_logits_ptr[i];
@@ -503,8 +517,7 @@ __global__ void paged_attention_v2_reduce_kernel(
 
   // Load rescaled exp sums to shared memory.
   float* shared_exp_sums = reinterpret_cast<float*>(shared_mem + sizeof(float) * num_partitions);
-  const float* exp_sums_ptr = exp_sums + seq_idx * num_heads * max_num_partitions
-                                       + head_idx * max_num_partitions;
+  const float* exp_sums_ptr = exp_sums + head_idx * num_seq_partitions + start_partition_idx;
   float global_exp_sum = 0.0f;
   for (int i = threadIdx.x; i < num_partitions; i += blockDim.x) {
     float l = shared_max_logits[i];
@@ -517,14 +530,14 @@ __global__ void paged_attention_v2_reduce_kernel(
   const float inv_global_exp_sum = __fdividef(1.0f, global_exp_sum + 1e-6f);
 
   // Aggregate tmp_out to out.
-  const scalar_t* tmp_out_ptr = tmp_out + seq_idx * num_heads * max_num_partitions * HEAD_SIZE
-                                        + head_idx * max_num_partitions * HEAD_SIZE;
+  const scalar_t* tmp_out_ptr = tmp_out + start_partition_idx * num_heads * HEAD_SIZE
+                                        + head_idx * HEAD_SIZE;
   scalar_t* out_ptr = out + seq_idx * num_heads * HEAD_SIZE + head_idx * HEAD_SIZE;
 #pragma unroll
   for (int i = threadIdx.x; i < HEAD_SIZE; i += NUM_THREADS) {
     float acc = 0.0f;
     for (int j = 0; j < num_partitions; ++j) {
-      acc += to_float(tmp_out_ptr[j * HEAD_SIZE + i]) * shared_exp_sums[j] * inv_global_exp_sum;
+      acc += to_float(tmp_out_ptr[j * num_heads * HEAD_SIZE + i]) * shared_exp_sums[j] * inv_global_exp_sum;
     }
     from_float(out_ptr[i], acc);
   }
@@ -600,7 +613,7 @@ void paged_attention_v1_launcher(
   // Keep that in sync with the logic here!
   int shared_mem_size = std::max(logits_size, outputs_size);
 
-  dim3 grid(num_heads, num_seqs, 1);
+  dim3 grid(num_heads, num_seqs);
   dim3 block(NUM_THREADS);
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
   switch (head_size) {
@@ -696,6 +709,8 @@ void paged_attention_v1(
 #define LAUNCH_PAGED_ATTENTION_V2(T, HEAD_SIZE, BLOCK_SIZE, NUM_THREADS, PARTITION_SIZE)      \
   vllm::paged_attention_v2_kernel<T, HEAD_SIZE, BLOCK_SIZE, NUM_THREADS, PARTITION_SIZE>      \
   <<<grid, block, shared_mem_size, stream>>>(                                                 \
+    seq_indices_ptr,                                                                          \
+    partition_indices_ptr,                                                                    \
     exp_sums_ptr,                                                                             \
     max_logits_ptr,                                                                           \
     tmp_out_ptr,                                                                              \
@@ -714,11 +729,11 @@ void paged_attention_v1(
   vllm::paged_attention_v2_reduce_kernel<T, HEAD_SIZE, NUM_THREADS, PARTITION_SIZE>           \
   <<<grid2, block, shared_mem_size2, stream>>>(                                               \
     out_ptr,                                                                                  \
+    cumulative_num_partitions_ptr,                                                            \
     exp_sums_ptr,                                                                             \
     max_logits_ptr,                                                                           \
     tmp_out_ptr,                                                                              \
-    context_lens_ptr,                                                                         \
-    max_num_partitions);
+    num_seq_partitions);
 
 template<
   typename T,
@@ -727,6 +742,9 @@ template<
   int PARTITION_SIZE = 512>
 void paged_attention_v2_launcher(
   torch::Tensor& out,
+  torch::Tensor& seq_indices,
+  torch::Tensor& partition_indices,
+  torch::Tensor& cumulative_num_partitions,
   torch::Tensor& exp_sums,
   torch::Tensor& max_logits,
   torch::Tensor& tmp_out,
@@ -756,6 +774,9 @@ void paged_attention_v2_launcher(
     : nullptr;
 
   T* out_ptr = reinterpret_cast<T*>(out.data_ptr());
+  int* seq_indices_ptr = seq_indices.data_ptr<int>();
+  int* partition_indices_ptr = partition_indices.data_ptr<int>();
+  int* cumulative_num_partitions_ptr = cumulative_num_partitions.data_ptr<int>();
   float* exp_sums_ptr = reinterpret_cast<float*>(exp_sums.data_ptr());
   float* max_logits_ptr = reinterpret_cast<float*>(max_logits.data_ptr());
   T* tmp_out_ptr = reinterpret_cast<T*>(tmp_out.data_ptr());
@@ -772,7 +793,8 @@ void paged_attention_v2_launcher(
   int outputs_size = (NUM_WARPS / 2) * head_size * sizeof(float);
 
   // For paged attention v2 kernel.
-  dim3 grid(num_heads, num_seqs, max_num_partitions);
+  int num_seq_partitions = seq_indices.size(0);
+  dim3 grid(num_heads, num_seq_partitions);
   int shared_mem_size = std::max(logits_size, outputs_size);
   // For paged attention v2 reduce kernel.
   dim3 grid2(num_heads, num_seqs);
@@ -819,6 +841,9 @@ void paged_attention_v2_launcher(
 #define CALL_V2_LAUNCHER(T, BLOCK_SIZE)                             \
   paged_attention_v2_launcher<T, BLOCK_SIZE>(                       \
     out,                                                            \
+    seq_indices,                                                    \
+    partition_indices,                                              \
+    cumulative_num_partitions,                                      \
     exp_sums,                                                       \
     max_logits,                                                     \
     tmp_out,                                                        \
@@ -852,9 +877,12 @@ void paged_attention_v2_launcher(
 
 void paged_attention_v2(
   torch::Tensor& out,             // [num_seqs, num_heads, head_size]
-  torch::Tensor& exp_sums,        // [num_seqs, num_heads, max_num_partitions]
-  torch::Tensor& max_logits,      // [num_seqs, num_heads, max_num_partitions]
-  torch::Tensor& tmp_out,         // [num_seqs, num_heads, max_num_partitions, head_size]
+  torch::Tensor& seq_indices,     // [num_seq_partitions]
+  torch::Tensor& partition_indices,
+  torch::Tensor& cumulative_num_partitions, // [num_seqs + 1]
+  torch::Tensor& exp_sums,        // [num_heads, num_seq_partitions]
+  torch::Tensor& max_logits,      // [num_heads, num_seq_partitions]
+  torch::Tensor& tmp_out,         // [num_seq_partitions, num_heads, head_size]
   torch::Tensor& query,           // [num_seqs, num_heads, head_size]
   torch::Tensor& key_cache,       // [num_blocks, num_heads, head_size/x, block_size, x]
   torch::Tensor& value_cache,     // [num_blocks, num_heads, head_size, block_size]
