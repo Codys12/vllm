@@ -180,20 +180,41 @@ def test_single_query_cached_kv_attention(
         )
     else:
         assert PARTITION_SIZE % block_size == 0
-        num_seqs, num_heads, head_size = output.shape
+        num_partitions_per_seq = [
+            (context_len + PARTITION_SIZE - 1) // PARTITION_SIZE
+            for context_len in context_lens.cpu().tolist()
+        ]
+        num_seq_partitions = sum(num_partitions_per_seq)
+        seq_indices = []
+        cumulative_num_partitions = [0]
+        for i, num_partitions in enumerate(num_partitions_per_seq):
+            seq_indices.extend([i] * num_partitions)
+            cumulative_num_partitions.append(
+                cumulative_num_partitions[-1] + num_partitions)
+        seq_indices = torch.tensor(
+            seq_indices, dtype=torch.int32, device=output.device)
+        cumulative_num_partitions = torch.tensor(
+            cumulative_num_partitions,
+            dtype=torch.int32,
+            device=output.device,
+        )
+
+        _, num_heads, head_size = output.shape
         tmp_output = torch.empty(
-            size=(num_seqs, num_heads, num_partitions, head_size),
+            size=(num_seq_partitions, num_heads, head_size),
             dtype=output.dtype,
             device=output.device,
         )
         exp_sums = torch.empty(
-            size=(num_seqs, num_heads, num_partitions),
+            size=(num_heads, num_seq_partitions),
             dtype=torch.float32,
             device=output.device,
         )
         max_logits = torch.empty_like(exp_sums)
         attention_ops.paged_attention_v2(
             output,
+            seq_indices,
+            cumulative_num_partitions,
             exp_sums,
             max_logits,
             tmp_output,
