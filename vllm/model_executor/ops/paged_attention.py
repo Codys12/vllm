@@ -108,8 +108,7 @@ def _paged_attn_kernel(
         m_i = m_i_new
         l_i = l_i_new
 
-    # NOTE: out_offset can be different from query_offset.
-    # NOTE: We assume the out tensor is contiguous.
+    # NOTE: Unlike the query tensor, we assume the out tensor is contiguous.
     out_offset = (seq_idx * NUM_KV_HEADS + kv_head_idx) * QUERY_GROUP_SIZE * HEAD_SIZE
     tl.store(out_ptr + query_offset, acc)
 
@@ -244,7 +243,7 @@ if __name__ == '__main__':
     torch.cuda.manual_seed(SEED)
 
     NUM_SEQS = 32
-    NUM_QUERY_GROUPS = 12
+    NUM_KV_HEADS = 12
     QUERY_GROUP_SIZE = 1
     NUM_BLOCKS = 7000
     HEAD_SIZE = 64
@@ -253,11 +252,12 @@ if __name__ == '__main__':
     MAX_NUM_BLOCKS_PER_SEQ = (max(CONTEXT_LENS) + KV_BLOCK_SIZE - 1) // KV_BLOCK_SIZE
 
     attn_scale = HEAD_SIZE ** -0.5
-    q = torch.empty(NUM_SEQS, NUM_QUERY_GROUPS * QUERY_GROUP_SIZE, HEAD_SIZE).cuda()
-    q.uniform_(-attn_scale, attn_scale)
+    qkv = torch.empty(NUM_SEQS, (QUERY_GROUP_SIZE + 2) * NUM_KV_HEADS, HEAD_SIZE).cuda()
+    qkv.uniform_(-attn_scale, attn_scale)
+    q = qkv[:, :-2 * NUM_KV_HEADS, :]
     out = torch.empty_like(q)
 
-    k_cache = torch.empty(NUM_BLOCKS, NUM_QUERY_GROUPS, KV_BLOCK_SIZE, HEAD_SIZE).cuda()
+    k_cache = torch.empty(NUM_BLOCKS, NUM_KV_HEADS, KV_BLOCK_SIZE, HEAD_SIZE).cuda()
     k_cache.uniform_(-attn_scale, attn_scale)
     v_cache = torch.empty_like(k_cache)
     v_cache.uniform_(-attn_scale, attn_scale)
