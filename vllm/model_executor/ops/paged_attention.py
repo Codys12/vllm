@@ -109,6 +109,7 @@ def _paged_attn_kernel(
         l_i = l_i_new
 
     # NOTE: out_offset can be different from query_offset.
+    # NOTE: We assume the out tensor is contiguous.
     out_offset = (seq_idx * NUM_KV_HEADS + kv_head_idx) * QUERY_GROUP_SIZE * HEAD_SIZE
     tl.store(out_ptr + query_offset, acc)
 
