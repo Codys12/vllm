@@ -76,7 +76,7 @@ if __name__ == "__main__":
     key_cache = torch.randn(1000, 12, 16, 64).cuda()
     value_cache = torch.randn_like(key_cache)
 
-    slot_mapping = torch.randint(0, 1000, (10,)).cuda()
+    slot_mapping = torch.randint(0, 1000, (10,)).cuda().long()
 
     cloned_key_cache = key_cache.clone()
     cloned_value_cache = value_cache.clone()
