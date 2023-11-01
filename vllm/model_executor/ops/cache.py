@@ -71,12 +71,18 @@ def reshape_and_cache(
 
 
 if __name__ == "__main__":
-    key = torch.randn(10, 12, 64).cuda()
+    NUM_TOKENS = 10
+    NUM_KV_HEADS = 12
+    HEAD_SIZE = 64
+    KV_BLOCK_SIZE = 16
+    NUM_BLOCKS = 1000
+
+    key = torch.randn(NUM_TOKENS, NUM_KV_HEADS, HEAD_SIZE).cuda()
     value = torch.randn_like(key)
-    key_cache = torch.randn(1000, 12, 16, 64).cuda()
+    key_cache = torch.randn(NUM_BLOCKS, NUM_KV_HEADS, KV_BLOCK_SIZE, HEAD_SIZE).cuda()
     value_cache = torch.randn_like(key_cache)
 
-    slot_mapping = torch.randint(0, 1000, (10,)).cuda().long()
+    slot_mapping = torch.randint(0, NUM_BLOCKS, (NUM_TOKENS,)).cuda().long()
 
     cloned_key_cache = key_cache.clone()
     cloned_value_cache = value_cache.clone()
