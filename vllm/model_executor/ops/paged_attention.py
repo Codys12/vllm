@@ -142,6 +142,7 @@ def paged_attention(
     assert max_num_partitions == 1
     assert not use_alibi
 
+    # TODO: Tune num_warps and num_stages.
     grid = (num_seqs, num_kv_heads, max_num_partitions)
     _paged_attn_kernel[grid](
         out,
