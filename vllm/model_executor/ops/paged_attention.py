@@ -120,10 +120,10 @@ def _paged_attn_kernel(
     tl.store(out_ptr + out_offset, acc)
 
 
-# Grid: (num_seqs, NUM_KV_HEADS, max_num_partitions)
+# Grid: (num_seqs, NUM_KV_HEADS, 1)
 @triton.jit
 def _paged_attn_kernel_v1(
-    out_ptr,                                 # [num_seqs, NUM_KV_HEADS, QUERY_GROUP_SIZE, max_num_partitions, HEAD_SIZE]
+    out_ptr,                                 # [num_seqs, NUM_KV_HEADS, QUERY_GROUP_SIZE, HEAD_SIZE]
     q_ptr,                                   # [num_seqs, NUM_KV_HEADS * QUERY_GROUP_SIZE, HEAD_SIZE]
     k_cache_ptr,                             # [num_blocks, NUM_KV_HEADS, KV_BLOCK_SIZE, HEAD_SIZE]
     v_cache_ptr,                             # [num_blocks, NUM_KV_HEADS, KV_BLOCK_SIZE, HEAD_SIZE]
