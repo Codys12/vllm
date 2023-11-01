@@ -230,21 +230,24 @@ def ref_single_query_cached_kv_attention(
 
 if __name__ == '__main__':
     torch.set_default_dtype(torch.half)
+    SEED = 0
+    torch.manual_seed(SEED)
+    torch.cuda.manual_seed(SEED)
 
-    NUM_SEQS = 2
+    NUM_SEQS = 8
     NUM_QUERY_GROUPS = 12
     QUERY_GROUP_SIZE = 1
-    NUM_BLOCKS = 100
+    NUM_BLOCKS = 1000
     HEAD_SIZE = 64
     KV_BLOCK_SIZE = 16
-    CONTEXT_LENS = [129, 65]
+    CONTEXT_LENS = [17, 20, 31, 40, 50, 60, 70, 80]
     MAX_NUM_BLOCKS_PER_SEQ = (max(CONTEXT_LENS) + KV_BLOCK_SIZE - 1) // KV_BLOCK_SIZE
 
     q = torch.randn(NUM_SEQS, NUM_QUERY_GROUPS * QUERY_GROUP_SIZE, HEAD_SIZE).cuda()
-    out = torch.zeros_like(q)
+    out = torch.empty_like(q)
     k_cache = torch.randn(NUM_BLOCKS, NUM_QUERY_GROUPS, KV_BLOCK_SIZE, HEAD_SIZE).cuda()
     v_cache = torch.randn_like(k_cache)
-    block_tables = torch.randint(0, 100, (NUM_SEQS, MAX_NUM_BLOCKS_PER_SEQ)).cuda()
+    block_tables = torch.randint(0, NUM_BLOCKS, (NUM_SEQS, MAX_NUM_BLOCKS_PER_SEQ)).cuda()
     alibi_slopes = None
     attn_scale = HEAD_SIZE ** -0.5
     context_lens = torch.tensor(CONTEXT_LENS, dtype=torch.int32).cuda()
