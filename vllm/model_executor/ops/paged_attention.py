@@ -8,13 +8,15 @@ import triton.language as tl
 # Grid: (num_seqs, NUM_KV_HEADS, max_num_partitions)
 @triton.jit
 def _paged_attn_kernel(
-    out_ptr,                                 # [num_seqs, QUERY_GROUP_SIZE * NUM_KV_HEADS, HEAD_SIZE]
-    q_ptr,                                   # [num_seqs, QUERY_GROUP_SIZE * NUM_KV_HEADS, HEAD_SIZE]
+    m_i_ptr,                                 # [num_seqs, NUM_KV_HEADS, QUERY_GROUP_SIZE, max_num_partitions]
+    l_i_ptr,                                 # [num_seqs, NUM_KV_HEADS, QUERY_GROUP_SIZE, max_num_partitions]
+    out_ptr,                                 # [num_seqs, NUM_KV_HEADS, QUERY_GROUP_SIZE, max_num_partitions, HEAD_SIZE]
+    q_ptr,                                   # [num_seqs, NUM_KV_HEADS * QUERY_GROUP_SIZE, HEAD_SIZE]
     k_cache_ptr,                             # [num_blocks, NUM_KV_HEADS, KV_BLOCK_SIZE, HEAD_SIZE]
     v_cache_ptr,                             # [num_blocks, NUM_KV_HEADS, KV_BLOCK_SIZE, HEAD_SIZE]
     context_lens_ptr,                        # [num_seqs]
     block_tables_ptr,                        # [num_seqs, max_num_blocks_per_seq]
-    alibi_slopes_ptr,                        # [QUERY_GROUP_SIZE * NUM_KV_HEADS]
+    alibi_slopes_ptr,                        # [NUM_KV_HEADS * QUERY_GROUP_SIZE]
     max_num_blocks_per_seq,
     attn_scale,
     USE_ALIBI: tl.constexpr,
@@ -30,15 +32,19 @@ def _paged_attn_kernel(
     seq_idx = tl.program_id(0)
     kv_head_idx = tl.program_id(1)
     partition_idx = tl.program_id(2)
+    USE_PARTITIONING = PARTITION_SIZE > 0
 
     context_len = tl.load(context_lens_ptr + seq_idx)
-    context_start_idx = partition_idx * PARTITION_SIZE
-    if context_start_idx >= context_len:
-        # Early exit.
-        return
     # This block processes [context_start_idx, context_end_idx).
-    context_end_idx = context_start_idx + PARTITION_SIZE
-    context_end_idx = tl.minimum(context_end_idx, context_len)
+    if USE_PARTITIONING:
+        context_start_idx = partition_idx * PARTITION_SIZE
+        if context_start_idx >= context_len:
+            # Early exit.
+            return
+        context_end_idx = tl.minimum(context_start_idx + PARTITION_SIZE, context_len)
+    else:
+        context_start_idx = 0
+        context_end_idx = context_len
 
     # Load queries.
     query_offset = seq_idx * Q_STRIDE + kv_head_idx * QUERY_GROUP_SIZE * HEAD_SIZE
@@ -114,6 +120,34 @@ def _paged_attn_kernel(
     tl.store(out_ptr + out_offset, acc)
 
 
+# Grid: (num_seqs, NUM_KV_HEADS, max_num_partitions)
+@triton.jit
+def _paged_attn_kernel_v1(
+    out_ptr,                                 # [num_seqs, NUM_KV_HEADS, QUERY_GROUP_SIZE, max_num_partitions, HEAD_SIZE]
+    q_ptr,                                   # [num_seqs, NUM_KV_HEADS * QUERY_GROUP_SIZE, HEAD_SIZE]
+    k_cache_ptr,                             # [num_blocks, NUM_KV_HEADS, KV_BLOCK_SIZE, HEAD_SIZE]
+    v_cache_ptr,                             # [num_blocks, NUM_KV_HEADS, KV_BLOCK_SIZE, HEAD_SIZE]
+    context_lens_ptr,                        # [num_seqs]
+    block_tables_ptr,                        # [num_seqs, max_num_blocks_per_seq]
+    alibi_slopes_ptr,                        # [NUM_KV_HEADS * QUERY_GROUP_SIZE]
+    max_num_blocks_per_seq,
+    attn_scale,
+    USE_ALIBI: tl.constexpr,
+    Q_STRIDE: tl.constexpr,
+    KV_BLOCK_STRIDE: tl.constexpr,
+    KV_HEAD_STRIDE: tl.constexpr,
+    HEAD_SIZE: tl.constexpr,
+    QUERY_GROUP_SIZE: tl.constexpr,
+    NUM_KV_HEADS: tl.constexpr,
+    KV_BLOCK_SIZE: tl.constexpr,
+):
+    _paged_attn_kernel(
+        None, None, out_ptr, q_ptr, k_cache_ptr, v_cache_ptr, context_lens_ptr, block_tables_ptr,
+        alibi_slopes_ptr, max_num_blocks_per_seq, attn_scale, USE_ALIBI, Q_STRIDE, KV_BLOCK_STRIDE,
+        KV_HEAD_STRIDE, HEAD_SIZE, QUERY_GROUP_SIZE, NUM_KV_HEADS, KV_BLOCK_SIZE, PARTITION_SIZE=0,
+    )
+
+
 def paged_attention(
     out: torch.Tensor,                  # [num_seqs, NUM_QUERY_GROUPS * QUERY_GROUP_SIZE, HEAD_SIZE]
     query: torch.Tensor,                # [num_seqs, NUM_QUERY_GROUPS * QUERY_GROUP_SIZE, HEAD_SIZE]
@@ -124,7 +158,7 @@ def paged_attention(
     alibi_slopes: Optional[torch.Tensor], # [NUM_QUERY_GROUPS * QUERY_GROUP_SIZE]
     attn_scale: float,
     max_context_len: int,
-    partition_size: int = 512,
+    v2_partition_size: int = 512,
 ) -> None:
     num_seqs = query.shape[0]
     num_kv_heads = key_cache.shape[1]
@@ -138,34 +172,55 @@ def paged_attention(
     use_alibi = alibi_slopes is not None
 
     # TEMP
-    max_num_partitions = triton.cdiv(max_context_len, partition_size)
-    assert max_num_partitions == 1
     assert not use_alibi
 
     # TODO: Tune num_warps and num_stages.
-    grid = (num_seqs, num_kv_heads, max_num_partitions)
-    _paged_attn_kernel[grid](
-        out,
-        query,
-        key_cache,
-        value_cache,
-        context_lens,
-        block_tables,
-        alibi_slopes,
-        max_num_blocks_per_seq,
-        attn_scale,
-        use_alibi,
-        query_stride,
-        kv_block_stride,
-        kv_head_stride,
-        head_size,
-        query_group_size,
-        num_kv_heads,
-        kv_block_size,
-        partition_size,
-    )
+    max_num_partitions = triton.cdiv(max_context_len, v2_partition_size)
+    if max_num_partitions == 1:
+        grid = (num_seqs, num_kv_heads, 1)
+        _paged_attn_kernel_v1[grid](
+            out,
+            query,
+            key_cache,
+            value_cache,
+            context_lens,
+            block_tables,
+            alibi_slopes,
+            max_num_blocks_per_seq,
+            attn_scale,
+            use_alibi,
+            query_stride,
+            kv_block_stride,
+            kv_head_stride,
+            head_size,
+            query_group_size,
+            num_kv_heads,
+            kv_block_size,
+        )
+    else:
+        assert False
+        grid = (num_seqs, num_kv_heads, max_num_partitions)
+        _paged_attn_kernel[grid](
+            out,
+            query,
+            key_cache,
+            value_cache,
+            context_lens,
+            block_tables,
+            alibi_slopes,
+            max_num_blocks_per_seq,
+            attn_scale,
+            use_alibi,
+            query_stride,
+            kv_block_stride,
+            kv_head_stride,
+            head_size,
+            query_group_size,
+            num_kv_heads,
+            kv_block_size,
+            v2_partition_size,
+        )
     return out
-
 
 
 def ref_masked_attention(
