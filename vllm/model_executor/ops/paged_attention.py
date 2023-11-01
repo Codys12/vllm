@@ -178,7 +178,6 @@ def ref_masked_attention(
 def ref_single_query_cached_kv_attention(
     output: torch.Tensor,
     query: torch.Tensor,
-    num_queries_per_kv: int,
     key_cache: torch.Tensor,
     value_cache: torch.Tensor,
     block_tables: torch.Tensor,
@@ -188,6 +187,7 @@ def ref_single_query_cached_kv_attention(
 ) -> None:
     num_query_heads = query.shape[1]
     num_kv_heads = value_cache.shape[1]
+    num_queries_per_kv = num_query_heads // num_kv_heads
     block_size = value_cache.shape[2]
     head_size = value_cache.shape[3]
     num_seqs = query.shape[0]
@@ -230,26 +230,33 @@ def ref_single_query_cached_kv_attention(
 
 if __name__ == '__main__':
     torch.set_default_dtype(torch.half)
-    SEED = 0
+    import random
+    SEED = 1
+    random.seed(SEED)
     torch.manual_seed(SEED)
     torch.cuda.manual_seed(SEED)
 
-    NUM_SEQS = 8
+    NUM_SEQS = 32
     NUM_QUERY_GROUPS = 12
     QUERY_GROUP_SIZE = 1
-    NUM_BLOCKS = 1000
+    NUM_BLOCKS = 7000
     HEAD_SIZE = 64
     KV_BLOCK_SIZE = 16
-    CONTEXT_LENS = [17, 20, 31, 40, 50, 60, 70, 80]
+    CONTEXT_LENS = [random.randint(1, 512) for _ in range(NUM_SEQS)]
     MAX_NUM_BLOCKS_PER_SEQ = (max(CONTEXT_LENS) + KV_BLOCK_SIZE - 1) // KV_BLOCK_SIZE
 
-    q = torch.randn(NUM_SEQS, NUM_QUERY_GROUPS * QUERY_GROUP_SIZE, HEAD_SIZE).cuda()
+    attn_scale = HEAD_SIZE ** -0.5
+    q = torch.empty(NUM_SEQS, NUM_QUERY_GROUPS * QUERY_GROUP_SIZE, HEAD_SIZE).cuda()
+    q.uniform_(-attn_scale, attn_scale)
     out = torch.empty_like(q)
-    k_cache = torch.randn(NUM_BLOCKS, NUM_QUERY_GROUPS, KV_BLOCK_SIZE, HEAD_SIZE).cuda()
-    v_cache = torch.randn_like(k_cache)
+
+    k_cache = torch.empty(NUM_BLOCKS, NUM_QUERY_GROUPS, KV_BLOCK_SIZE, HEAD_SIZE).cuda()
+    k_cache.uniform_(-attn_scale, attn_scale)
+    v_cache = torch.empty_like(k_cache)
+    v_cache.uniform_(-attn_scale, attn_scale)
+
     block_tables = torch.randint(0, NUM_BLOCKS, (NUM_SEQS, MAX_NUM_BLOCKS_PER_SEQ)).cuda()
     alibi_slopes = None
-    attn_scale = HEAD_SIZE ** -0.5
     context_lens = torch.tensor(CONTEXT_LENS, dtype=torch.int32).cuda()
     max_context_len = max(CONTEXT_LENS)
 
@@ -269,7 +276,6 @@ if __name__ == '__main__':
     ref_single_query_cached_kv_attention(
         ref_out,
         q,
-        QUERY_GROUP_SIZE,
         k_cache,
         v_cache,
         block_tables,
