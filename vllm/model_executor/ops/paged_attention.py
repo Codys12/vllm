@@ -122,7 +122,7 @@ def _paged_attn_kernel(
 
 # Grid: (num_seqs, NUM_KV_HEADS, 1)
 @triton.jit
-def _paged_attn_kernel_v1(
+def _paged_attn_v1_kernel(
     out_ptr,                                 # [num_seqs, NUM_KV_HEADS, QUERY_GROUP_SIZE, HEAD_SIZE]
     q_ptr,                                   # [num_seqs, NUM_KV_HEADS * QUERY_GROUP_SIZE, HEAD_SIZE]
     k_cache_ptr,                             # [num_blocks, NUM_KV_HEADS, KV_BLOCK_SIZE, HEAD_SIZE]
@@ -178,7 +178,7 @@ def paged_attention(
     max_num_partitions = triton.cdiv(max_context_len, v2_partition_size)
     if max_num_partitions == 1:
         grid = (num_seqs, num_kv_heads, 1)
-        _paged_attn_kernel_v1[grid](
+        _paged_attn_v1_kernel[grid](
             out,
             query,
             key_cache,
