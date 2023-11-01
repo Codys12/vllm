@@ -96,7 +96,7 @@ def _paged_attn_kernel(
         p = p.to(value.dtype)
         if QUERY_GROUP_SIZE == 1:
             # MHA.
-            acc += tl.sum(p.T * value, axis=0)[None, :]
+            acc += tl.sum((p.T * value).to(tl.float32), axis=0)[None, :]
         else:
             # MQA/GQA.
             # NOTE(woosuk): QUERY_GROUP_SIZE must be >= 16.
@@ -232,10 +232,10 @@ if __name__ == '__main__':
     torch.set_default_dtype(torch.half)
 
     NUM_SEQS = 2
-    NUM_QUERY_GROUPS = 2
+    NUM_QUERY_GROUPS = 12
     QUERY_GROUP_SIZE = 1
     NUM_BLOCKS = 100
-    HEAD_SIZE = 128
+    HEAD_SIZE = 64
     KV_BLOCK_SIZE = 16
     CONTEXT_LENS = [129, 65]
     MAX_NUM_BLOCKS_PER_SEQ = (max(CONTEXT_LENS) + KV_BLOCK_SIZE - 1) // KV_BLOCK_SIZE
