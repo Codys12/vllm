@@ -110,7 +110,8 @@ def _paged_attn_kernel(
 
     # NOTE: Unlike the query tensor, we assume the out tensor is contiguous.
     out_offset = (seq_idx * NUM_KV_HEADS + kv_head_idx) * QUERY_GROUP_SIZE * HEAD_SIZE
-    tl.store(out_ptr + query_offset, acc)
+    out_offset += tl.arange(0, QUERY_GROUP_SIZE)[:, None] * HEAD_SIZE + tl.arange(0, HEAD_SIZE)[None, :]
+    tl.store(out_ptr + out_offset, acc)
 
 
 def paged_attention(
