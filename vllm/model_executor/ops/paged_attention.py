@@ -5,16 +5,16 @@ import triton
 import triton.language as tl
 
 
-# Grid: (num_seqs, NUM_QUERY_GROUPS, max_num_partitions)
+# Grid: (num_seqs, NUM_KV_HEADS, max_num_partitions)
 @triton.jit
 def _paged_attn_kernel(
-    out_ptr,                                 # [num_seqs, NUM_QUERY_GROUPS * QUERY_GROUP_SIZE, HEAD_SIZE]
-    q_ptr,                                   # [num_seqs, NUM_QUERY_GROUPS * QUERY_GROUP_SIZE, HEAD_SIZE]
-    k_cache_ptr,                             # [num_blocks, NUM_QUERY_GROUPS, KV_BLOCK_SIZE, HEAD_SIZE]
-    v_cache_ptr,                             # [num_blocks, NUM_QUERY_GROUPS, KV_BLOCK_SIZE, HEAD_SIZE]
+    out_ptr,                                 # [num_seqs, QUERY_GROUP_SIZE * NUM_KV_HEADS, HEAD_SIZE]
+    q_ptr,                                   # [num_seqs, QUERY_GROUP_SIZE * NUM_KV_HEADS, HEAD_SIZE]
+    k_cache_ptr,                             # [num_blocks, NUM_KV_HEADS, KV_BLOCK_SIZE, HEAD_SIZE]
+    v_cache_ptr,                             # [num_blocks, NUM_KV_HEADS, KV_BLOCK_SIZE, HEAD_SIZE]
     context_lens_ptr,                        # [num_seqs]
     block_tables_ptr,                        # [num_seqs, max_num_blocks_per_seq]
-    alibi_slopes_ptr,                        # [NUM_QUERY_GROUPS * QUERY_GROUP_SIZE]
+    alibi_slopes_ptr,                        # [QUERY_GROUP_SIZE * NUM_KV_HEADS]
     max_num_blocks_per_seq,
     attn_scale,
     USE_ALIBI: tl.constexpr,
@@ -23,11 +23,12 @@ def _paged_attn_kernel(
     KV_HEAD_STRIDE: tl.constexpr,
     HEAD_SIZE: tl.constexpr,
     QUERY_GROUP_SIZE: tl.constexpr,
+    NUM_KV_HEADS: tl.constexpr,
     KV_BLOCK_SIZE: tl.constexpr,
     PARTITION_SIZE: tl.constexpr,
 ):
     seq_idx = tl.program_id(0)
-    query_group_idx = tl.program_id(1)
+    kv_head_idx = tl.program_id(1)
     partition_idx = tl.program_id(2)
 
     context_len = tl.load(context_lens_ptr + seq_idx)
@@ -40,7 +41,7 @@ def _paged_attn_kernel(
     context_end_idx = tl.minimum(context_end_idx, context_len)
 
     # Load queries.
-    query_offset = seq_idx * Q_STRIDE + query_group_idx * QUERY_GROUP_SIZE * HEAD_SIZE
+    query_offset = seq_idx * Q_STRIDE + kv_head_idx * QUERY_GROUP_SIZE * HEAD_SIZE
     # NOTE(woosuk): Here we assume that QUERY_GROUP_SIZE and HEAD_SIZE are both powers of 2.
     query_offset += tl.arange(0, QUERY_GROUP_SIZE)[:, None] * HEAD_SIZE + tl.arange(0, HEAD_SIZE)[None, :]
     query = tl.load(q_ptr + query_offset)
@@ -57,7 +58,7 @@ def _paged_attn_kernel(
         block_number = tl.load(block_tables_ptr + seq_idx * max_num_blocks_per_seq + block_idx)
 
         # Load a key block.
-        kv_offset = block_number * KV_BLOCK_STRIDE + query_group_idx * KV_HEAD_STRIDE
+        kv_offset = block_number * KV_BLOCK_STRIDE + kv_head_idx * KV_HEAD_STRIDE
         kv_offset += tl.arange(0, KV_BLOCK_SIZE)[:, None] * HEAD_SIZE + tl.arange(0, HEAD_SIZE)[None, :]
         kv_mask = (start_idx + tl.arange(0, KV_BLOCK_SIZE)[:, None]) < context_len
         key = tl.load(k_cache_ptr + kv_offset, mask=kv_mask, other=0.0)
@@ -85,6 +86,7 @@ def _paged_attn_kernel(
         beta = tl.exp(m_ij - m_i_new)
         l_i_new = alpha * l_i + beta * l_ij
 
+        # Update accumulators.
         p_scale = beta / l_i_new
         p = p * p_scale[:, None]
         acc_scale = l_i / l_i_new * alpha
@@ -102,8 +104,12 @@ def _paged_attn_kernel(
             # NOTE(woosuk): QUERY_GROUP_SIZE must be >= 16.
             acc += tl.dot(p, value)
 
+        # Update m and l.
         m_i = m_i_new
         l_i = l_i_new
+
+    # NOTE: out_offset can be different from query_offset.
+    out_offset = (seq_idx * NUM_KV_HEADS + kv_head_idx) * QUERY_GROUP_SIZE * HEAD_SIZE
     tl.store(out_ptr + query_offset, acc)
 
 
@@ -131,9 +137,10 @@ def paged_attention(
     use_alibi = alibi_slopes is not None
 
     # TEMP
+    max_num_partitions = triton.cdiv(max_context_len, partition_size)
+    assert max_num_partitions == 1
     assert not use_alibi
 
-    max_num_partitions = triton.cdiv(max_context_len, partition_size)
     grid = (num_seqs, num_kv_heads, max_num_partitions)
     _paged_attn_kernel[grid](
         out,
@@ -151,10 +158,9 @@ def paged_attention(
         kv_head_stride,
         head_size,
         query_group_size,
+        num_kv_heads,
         kv_block_size,
         partition_size,
-        num_warps=4,
-        num_stages=1,
     )
     return out
 
