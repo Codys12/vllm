@@ -256,13 +256,13 @@ def _paged_attn_v2_reduce_kernel(
 
 
 def paged_attention(
-    out: torch.Tensor,                  # [num_seqs, NUM_QUERY_GROUPS * QUERY_GROUP_SIZE, HEAD_SIZE]
-    query: torch.Tensor,                # [num_seqs, NUM_QUERY_GROUPS * QUERY_GROUP_SIZE, HEAD_SIZE]
-    key_cache: torch.Tensor,            # [num_blocks, NUM_QUERY_GROUPS, KV_BLOCK_SIZE, HEAD_SIZE]
-    value_cache: torch.Tensor,          # [num_blocks, NUM_QUERY_GROUPS, KV_BLOCK_SIZE, HEAD_SIZE]
-    context_lens: torch.Tensor,         # [num_seqs]
-    block_tables: torch.Tensor,         # [num_seqs, max_num_blocks_per_seq]
-    alibi_slopes: Optional[torch.Tensor], # [NUM_QUERY_GROUPS * QUERY_GROUP_SIZE]
+    out: torch.Tensor,                      # [num_seqs, NUM_KV_HEADS * QUERY_GROUP_SIZE, HEAD_SIZE]
+    query: torch.Tensor,                    # [num_seqs, NUM_KV_HEADS * QUERY_GROUP_SIZE, HEAD_SIZE]
+    key_cache: torch.Tensor,                # [num_blocks, NUM_KV_HEADS, KV_BLOCK_SIZE, HEAD_SIZE]
+    value_cache: torch.Tensor,              # [num_blocks, NUM_KV_HEADS, KV_BLOCK_SIZE, HEAD_SIZE]
+    context_lens: torch.Tensor,             # [num_seqs]
+    block_tables: torch.Tensor,             # [num_seqs, max_num_blocks_per_seq]
+    alibi_slopes: Optional[torch.Tensor],   # [NUM_KV_HEADS * QUERY_GROUP_SIZE]
     attn_scale: float,
     max_context_len: int,
     v2_partition_size: int = 512,
