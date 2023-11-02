@@ -88,16 +88,16 @@ def main(
             device=output.device,
         )
         max_logits = torch.empty_like(exp_sums)
+    triton_impl_versions = {
+        "triton-v1": 1,
+        "triton-v2": 2,
+    }
 
     def run_benchmark(num_iters: int, profile: bool = False) -> float:
         torch.cuda.synchronize()
         if profile:
             torch.cuda.cudart().cudaProfilerStart()
         start_time = time.perf_counter()
-        triton_impl_versions = {
-            "triton-v1": 1,
-            "triton-v2": 2,
-        }
 
         for _ in range(num_iters):
             if version == "v1":
