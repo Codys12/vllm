@@ -279,6 +279,9 @@ def paged_attention(
     kv_head_stride = key_cache.stride(1)
     use_alibi = alibi_slopes is not None
 
+    # FIXME: Remove this constraint.
+    assert head_size in [64, 128, 256]
+    assert query_group_size in [16, 32, 64, 128]
     # TODO: Support ALiBi.
     assert not use_alibi
     # TODO: Tune num_warps and num_stages.
