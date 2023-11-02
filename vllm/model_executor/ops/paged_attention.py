@@ -75,7 +75,7 @@ def _paged_attn_kernel(
         key = tl.load(k_cache_ptr + kv_offset, mask=kv_mask, other=0.0)
 
         # Compute attention.
-        if QUERY_GROUP_SIZE == 1:
+        if PADDED_QUERY_GROUP_SIZE == 1:
             # MHA.
             # query: [1, HEAD_SIZE]
             # qk: [KV_BLOCK_SIZE, HEAD_SIZE]
@@ -121,7 +121,7 @@ def _paged_attn_kernel(
         value = tl.load(v_cache_ptr + kv_offset, mask=kv_mask, other=0.0)
 
         p = p.to(value.dtype)
-        if QUERY_GROUP_SIZE == 1:
+        if PADDED_QUERY_GROUP_SIZE == 1:
             # MHA.
             acc += tl.sum((p.T * value).to(tl.float32), axis=0)[None, :]
         else:
@@ -317,9 +317,7 @@ def paged_attention(
     kv_head_stride = key_cache.stride(1)
     use_alibi = alibi_slopes is not None
 
-    if query_group_size == 1:
-        padded_group_size = 1
-    elif query_group_size < 16:
+    if query_group_size < 16:
         padded_group_size = 16
     else:
         padded_group_size = triton.next_power_of_2(query_group_size)
