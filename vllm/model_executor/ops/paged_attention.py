@@ -51,6 +51,7 @@ def _paged_attn_kernel(
     query_offset = seq_idx * Q_STRIDE + kv_head_idx * QUERY_GROUP_SIZE * HEAD_SIZE
     # NOTE(woosuk): Here we assume that QUERY_GROUP_SIZE and HEAD_SIZE are both powers of 2.
     query_offset += tl.arange(0, QUERY_GROUP_SIZE)[:, None] * HEAD_SIZE + tl.arange(0, HEAD_SIZE)[None, :]
+    # query: [QUERY_GROUP_SIZE, HEAD_SIZE]
     query = tl.load(q_ptr + query_offset)
 
     # Initialize accumulators.
@@ -68,38 +69,56 @@ def _paged_attn_kernel(
         kv_offset = block_number * KV_BLOCK_STRIDE + kv_head_idx * KV_HEAD_STRIDE
         kv_offset += tl.arange(0, KV_BLOCK_SIZE)[:, None] * HEAD_SIZE + tl.arange(0, HEAD_SIZE)[None, :]
         kv_mask = (start_idx + tl.arange(0, KV_BLOCK_SIZE)[:, None]) < context_len
+        # key: [KV_BLOCK_SIZE, HEAD_SIZE]
         key = tl.load(k_cache_ptr + kv_offset, mask=kv_mask, other=0.0)
 
         # Compute attention.
         if QUERY_GROUP_SIZE == 1:
             # MHA.
+            # query: [1, HEAD_SIZE]
+            # qk: [KV_BLOCK_SIZE, HEAD_SIZE]
             qk = query * key
+            # qk: [1, KV_BLOCK_SIZE]
             qk = tl.sum(qk.to(tl.float32), axis=1)[None, :]
         else:
             # MQA/GQA.
             # NOTE(woosuk): QUERY_GROUP_SIZE must be >= 16.
             # Initialize qk to indicate that it uses FP32.
+            # qk: [QUERY_GROUP_SIZE, KV_BLOCK_SIZE]
             qk = tl.zeros([QUERY_GROUP_SIZE, KV_BLOCK_SIZE], dtype=tl.float32)
             qk = tl.dot(query, key.T)
+        # qk: [QUERY_GROUP_SIZE, KV_BLOCK_SIZE]
         qk *= attn_scale
         qk = tl.where(start_idx + tl.arange(0, KV_BLOCK_SIZE) < context_len, qk, float("-inf"))
 
         # Compute m, l, and p.
+        # m_ij: [QUERY_GROUP_SIZE]
         m_ij = tl.max(qk, axis=1)
+        # p: [QUERY_GROUP_SIZE, KV_BLOCK_SIZE]
         p = tl.exp(qk - m_ij[:, None])
+        # l_ij: [QUERY_GROUP_SIZE]
         l_ij = tl.sum(p, axis=1)
+        # m_i_new: [QUERY_GROUP_SIZE]
         m_i_new = tl.maximum(m_i, m_ij)
+        # alpha: [QUERY_GROUP_SIZE]
         alpha = tl.exp(m_i - m_i_new)
+        # beta: [QUERY_GROUP_SIZE]
         beta = tl.exp(m_ij - m_i_new)
+        # l_i_new: [QUERY_GROUP_SIZE]
         l_i_new = alpha * l_i + beta * l_ij
 
         # Update accumulators.
+        # p_scale: [QUERY_GROUP_SIZE]
         p_scale = beta / l_i_new
+        # p: [QUERY_GROUP_SIZE, KV_BLOCK_SIZE]
         p = p * p_scale[:, None]
+        # acc_scale: [QUERY_GROUP_SIZE]
         acc_scale = l_i / l_i_new * alpha
+        # acc: [QUERY_GROUP_SIZE, HEAD_SIZE]
         acc = acc * acc_scale[:, None]
 
         # Load a value block.
+        # value: [KV_BLOCK_SIZE, HEAD_SIZE]
         value = tl.load(v_cache_ptr + kv_offset, mask=kv_mask, other=0.0)
 
         p = p.to(value.dtype)
@@ -131,6 +150,23 @@ def _paged_attn_kernel(
 
 
 # Grid: (num_seqs, NUM_KV_HEADS, 1)
+@triton.autotune(
+    configs=[
+        triton.Config({}, num_stages=1, num_warps=1),
+        triton.Config({}, num_stages=2, num_warps=1),
+        triton.Config({}, num_stages=3, num_warps=1),
+        triton.Config({}, num_stages=1, num_warps=2),
+        triton.Config({}, num_stages=2, num_warps=2),
+        triton.Config({}, num_stages=3, num_warps=2),
+        triton.Config({}, num_stages=1, num_warps=4),
+        triton.Config({}, num_stages=2, num_warps=4),
+        triton.Config({}, num_stages=3, num_warps=4),
+        triton.Config({}, num_stages=1, num_warps=8),
+        triton.Config({}, num_stages=2, num_warps=8),
+        triton.Config({}, num_stages=3, num_warps=8),
+    ],
+    key=["QUERY_GROUP_SIZE", "HEAD_SIZE"],
+)
 @triton.jit
 def _paged_attn_v1_kernel(
     out_ptr,
