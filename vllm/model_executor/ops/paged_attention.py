@@ -282,6 +282,8 @@ def paged_attention(
     # FIXME: Remove this constraint.
     assert head_size in [64, 128, 256]
     assert query_group_size in [16, 32, 64, 128]
+    assert kv_block_size in [16, 32, 64, 128, 256, 512]
+
     # TODO: Support ALiBi.
     assert not use_alibi
     # TODO: Tune num_warps and num_stages.
