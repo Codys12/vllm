@@ -133,13 +133,13 @@ def _paged_attn_kernel(
 # Grid: (num_seqs, NUM_KV_HEADS, 1)
 @triton.jit
 def _paged_attn_v1_kernel(
-    out_ptr,                                 # [num_seqs, NUM_KV_HEADS, QUERY_GROUP_SIZE, HEAD_SIZE]
-    q_ptr,                                   # [num_seqs, NUM_KV_HEADS * QUERY_GROUP_SIZE, HEAD_SIZE]
-    k_cache_ptr,                             # [num_blocks, NUM_KV_HEADS, KV_BLOCK_SIZE, HEAD_SIZE]
-    v_cache_ptr,                             # [num_blocks, NUM_KV_HEADS, KV_BLOCK_SIZE, HEAD_SIZE]
-    context_lens_ptr,                        # [num_seqs]
-    block_tables_ptr,                        # [num_seqs, max_num_blocks_per_seq]
-    alibi_slopes_ptr,                        # [NUM_KV_HEADS * QUERY_GROUP_SIZE]
+    out_ptr,
+    q_ptr,
+    k_cache_ptr,
+    v_cache_ptr,
+    context_lens_ptr,
+    block_tables_ptr,
+    alibi_slopes_ptr,
     max_num_blocks_per_seq,
     attn_scale,
     USE_ALIBI: tl.constexpr,
@@ -162,15 +162,15 @@ def _paged_attn_v1_kernel(
 # Grid: (num_seqs, NUM_KV_HEADS, max_num_partitions)
 @triton.jit
 def _paged_attn_v2_kernel(
-    m_i_ptr,                                 # [num_seqs, NUM_KV_HEADS, max_num_partitions, QUERY_GROUP_SIZE]
-    l_i_ptr,                                 # [num_seqs, NUM_KV_HEADS, max_num_partitions, QUERY_GROUP_SIZE]
-    tmp_out_ptr,                             # [num_seqs, NUM_KV_HEADS, max_num_partitions, QUERY_GROUP_SIZE, HEAD_SIZE]
-    q_ptr,                                   # [num_seqs, NUM_KV_HEADS * QUERY_GROUP_SIZE, HEAD_SIZE]
-    k_cache_ptr,                             # [num_blocks, NUM_KV_HEADS, KV_BLOCK_SIZE, HEAD_SIZE]
-    v_cache_ptr,                             # [num_blocks, NUM_KV_HEADS, KV_BLOCK_SIZE, HEAD_SIZE]
-    context_lens_ptr,                        # [num_seqs]
-    block_tables_ptr,                        # [num_seqs, max_num_blocks_per_seq]
-    alibi_slopes_ptr,                        # [NUM_KV_HEADS * QUERY_GROUP_SIZE]
+    m_i_ptr,
+    l_i_ptr,
+    tmp_out_ptr,
+    q_ptr,
+    k_cache_ptr,
+    v_cache_ptr,
+    context_lens_ptr,
+    block_tables_ptr,
+    alibi_slopes_ptr,
     max_num_blocks_per_seq,
     attn_scale,
     USE_ALIBI: tl.constexpr,
@@ -249,7 +249,7 @@ def _paged_attn_v2_reduce_kernel(
     # out: [QUERY_GROUP_SIZE, HEAD_SIZE]
     out = tl.sum((tmp_out * r[:, :, None]).to(tl.float32), axis=0)
 
-    # Store out.
+    # Store output.
     out_offset = (seq_idx * NUM_KV_HEADS + kv_head_idx) * QUERY_GROUP_SIZE * HEAD_SIZE
     out_offset += group_head_offset
     tl.store(out_ptr + out_offset, out)
