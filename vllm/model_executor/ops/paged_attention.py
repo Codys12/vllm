@@ -25,6 +25,7 @@ def _paged_attn_kernel(
     KV_HEAD_STRIDE: tl.constexpr,
     HEAD_SIZE: tl.constexpr,
     QUERY_GROUP_SIZE: tl.constexpr,
+    PADDED_QUERY_GROUP_SIZE: tl.constexpr,
     NUM_KV_HEADS: tl.constexpr,
     KV_BLOCK_SIZE: tl.constexpr,
     PARTITION_SIZE: tl.constexpr,
@@ -49,15 +50,16 @@ def _paged_attn_kernel(
 
     # Load queries.
     query_offset = seq_idx * Q_STRIDE + kv_head_idx * QUERY_GROUP_SIZE * HEAD_SIZE
-    # NOTE(woosuk): Here we assume that QUERY_GROUP_SIZE and HEAD_SIZE are both powers of 2.
-    query_offset += tl.arange(0, QUERY_GROUP_SIZE)[:, None] * HEAD_SIZE + tl.arange(0, HEAD_SIZE)[None, :]
-    # query: [QUERY_GROUP_SIZE, HEAD_SIZE]
-    query = tl.load(q_ptr + query_offset)
+    # NOTE(woosuk): Here we assume HEAD_SIZE is a power of 2.
+    query_offset += tl.arange(0, PADDED_QUERY_GROUP_SIZE)[:, None] * HEAD_SIZE + tl.arange(0, HEAD_SIZE)[None, :]
+    group_mask = tl.arange(0, PADDED_QUERY_GROUP_SIZE)[:, None] < QUERY_GROUP_SIZE
+    # query: [PADDED_QUERY_GROUP_SIZE, HEAD_SIZE]
+    query = tl.load(q_ptr + query_offset, mask=group_mask, other=0.0)
 
     # Initialize accumulators.
-    m_i = tl.zeros([QUERY_GROUP_SIZE], dtype=tl.float32) - float("inf")
-    l_i = tl.zeros([QUERY_GROUP_SIZE], dtype=tl.float32)
-    acc = tl.zeros([QUERY_GROUP_SIZE, HEAD_SIZE], dtype=tl.float32)
+    m_i = tl.zeros([PADDED_QUERY_GROUP_SIZE], dtype=tl.float32) - float("inf")
+    l_i = tl.zeros([PADDED_QUERY_GROUP_SIZE], dtype=tl.float32)
+    acc = tl.zeros([PADDED_QUERY_GROUP_SIZE, HEAD_SIZE], dtype=tl.float32)
 
     # NOTE: KV_BLOCK_SIZE must be >= 16.
     for start_idx in range(context_start_idx, context_end_idx, KV_BLOCK_SIZE):
@@ -82,39 +84,36 @@ def _paged_attn_kernel(
             qk = tl.sum(qk.to(tl.float32), axis=1)[None, :]
         else:
             # MQA/GQA.
-            # NOTE(woosuk): QUERY_GROUP_SIZE must be >= 16.
-            # Initialize qk to indicate that it uses FP32.
-            # qk: [QUERY_GROUP_SIZE, KV_BLOCK_SIZE]
-            qk = tl.zeros([QUERY_GROUP_SIZE, KV_BLOCK_SIZE], dtype=tl.float32)
-            qk = tl.dot(query, key.T)
-        # qk: [QUERY_GROUP_SIZE, KV_BLOCK_SIZE]
+            # qk: [PADDED_QUERY_GROUP_SIZE, KV_BLOCK_SIZE]
+            qk = tl.dot(query, key.T, out_dtype=tl.float32)
+        # qk: [PADDED_QUERY_GROUP_SIZE, KV_BLOCK_SIZE]
         qk *= attn_scale
         qk = tl.where(start_idx + tl.arange(0, KV_BLOCK_SIZE) < context_len, qk, float("-inf"))
 
         # Compute m, l, and p.
-        # m_ij: [QUERY_GROUP_SIZE]
+        # m_ij: [PADDED_QUERY_GROUP_SIZE]
         m_ij = tl.max(qk, axis=1)
-        # p: [QUERY_GROUP_SIZE, KV_BLOCK_SIZE]
+        # p: [PADDED_QUERY_GROUP_SIZE, KV_BLOCK_SIZE]
         p = tl.exp(qk - m_ij[:, None])
-        # l_ij: [QUERY_GROUP_SIZE]
+        # l_ij: [PADDED_QUERY_GROUP_SIZE]
         l_ij = tl.sum(p, axis=1)
-        # m_i_new: [QUERY_GROUP_SIZE]
+        # m_i_new: [PADDED_QUERY_GROUP_SIZE]
         m_i_new = tl.maximum(m_i, m_ij)
-        # alpha: [QUERY_GROUP_SIZE]
+        # alpha: [PADDED_QUERY_GROUP_SIZE]
         alpha = tl.exp(m_i - m_i_new)
-        # beta: [QUERY_GROUP_SIZE]
+        # beta: [PADDED_QUERY_GROUP_SIZE]
         beta = tl.exp(m_ij - m_i_new)
-        # l_i_new: [QUERY_GROUP_SIZE]
+        # l_i_new: [PADDED_QUERY_GROUP_SIZE]
         l_i_new = alpha * l_i + beta * l_ij
 
         # Update accumulators.
-        # p_scale: [QUERY_GROUP_SIZE]
+        # p_scale: [PADDED_QUERY_GROUP_SIZE]
         p_scale = beta / l_i_new
-        # p: [QUERY_GROUP_SIZE, KV_BLOCK_SIZE]
+        # p: [PADDED_QUERY_GROUP_SIZE, KV_BLOCK_SIZE]
         p = p * p_scale[:, None]
-        # acc_scale: [QUERY_GROUP_SIZE]
+        # acc_scale: [PADDED_QUERY_GROUP_SIZE]
         acc_scale = l_i / l_i_new * alpha
-        # acc: [QUERY_GROUP_SIZE, HEAD_SIZE]
+        # acc: [PADDED_QUERY_GROUP_SIZE, HEAD_SIZE]
         acc = acc * acc_scale[:, None]
 
         # Load a value block.
@@ -127,7 +126,6 @@ def _paged_attn_kernel(
             acc += tl.sum((p.T * value).to(tl.float32), axis=0)[None, :]
         else:
             # MQA/GQA.
-            # NOTE(woosuk): QUERY_GROUP_SIZE must be >= 16.
             acc += tl.dot(p, value)
 
         # Update m and l.
@@ -138,15 +136,17 @@ def _paged_attn_kernel(
     if USE_PARTITIONING:
         partition_offset = (seq_idx * NUM_KV_HEADS + kv_head_idx) * max_num_partitions * QUERY_GROUP_SIZE
         partition_offset += partition_idx * QUERY_GROUP_SIZE
-        partition_offset += tl.arange(0, QUERY_GROUP_SIZE)
-        tl.store(m_i_ptr + partition_offset, m_i)
-        tl.store(l_i_ptr + partition_offset, l_i)
+        partition_offset += tl.arange(0, PADDED_QUERY_GROUP_SIZE)
+        mask = tl.arange(0, PADDED_QUERY_GROUP_SIZE) < QUERY_GROUP_SIZE
+        tl.store(m_i_ptr + partition_offset, m_i, mask=mask)
+        tl.store(l_i_ptr + partition_offset, l_i, mask=mask)
 
     # NOTE: Unlike the query tensor, we assume the out tensor is contiguous.
     out_offset = (seq_idx * NUM_KV_HEADS + kv_head_idx) * max_num_partitions * QUERY_GROUP_SIZE * HEAD_SIZE
     out_offset += partition_idx * QUERY_GROUP_SIZE * HEAD_SIZE
-    out_offset += tl.arange(0, QUERY_GROUP_SIZE)[:, None] * HEAD_SIZE + tl.arange(0, HEAD_SIZE)[None, :]
-    tl.store(out_ptr + out_offset, acc) 
+    out_offset += tl.arange(0, PADDED_QUERY_GROUP_SIZE)[:, None] * HEAD_SIZE + tl.arange(0, HEAD_SIZE)[None, :]
+    group_mask = tl.arange(0, PADDED_QUERY_GROUP_SIZE)[:, None] < QUERY_GROUP_SIZE
+    tl.store(out_ptr + out_offset, acc, mask=group_mask) 
 
 
 # Grid: (num_seqs, NUM_KV_HEADS, 1)
@@ -165,7 +165,7 @@ def _paged_attn_kernel(
         triton.Config({}, num_stages=2, num_warps=8),
         triton.Config({}, num_stages=3, num_warps=8),
     ],
-    key=["QUERY_GROUP_SIZE", "HEAD_SIZE"],
+    key=[],
 )
 @triton.jit
 def _paged_attn_v1_kernel(
@@ -184,6 +184,7 @@ def _paged_attn_v1_kernel(
     KV_HEAD_STRIDE: tl.constexpr,
     HEAD_SIZE: tl.constexpr,
     QUERY_GROUP_SIZE: tl.constexpr,
+    PADDED_QUERY_GROUP_SIZE: tl.constexpr,
     NUM_KV_HEADS: tl.constexpr,
     KV_BLOCK_SIZE: tl.constexpr,
 ):
@@ -191,7 +192,7 @@ def _paged_attn_v1_kernel(
     _paged_attn_kernel(
         out_ptr, out_ptr, out_ptr, q_ptr, k_cache_ptr, v_cache_ptr, context_lens_ptr, block_tables_ptr,
         alibi_slopes_ptr, max_num_blocks_per_seq, attn_scale, USE_ALIBI, Q_STRIDE, KV_BLOCK_STRIDE,
-        KV_HEAD_STRIDE, HEAD_SIZE, QUERY_GROUP_SIZE, NUM_KV_HEADS, KV_BLOCK_SIZE, PARTITION_SIZE=0,
+        KV_HEAD_STRIDE, HEAD_SIZE, QUERY_GROUP_SIZE, PADDED_QUERY_GROUP_SIZE, NUM_KV_HEADS, KV_BLOCK_SIZE, PARTITION_SIZE=0,
     )
 
 
@@ -215,6 +216,7 @@ def _paged_attn_v2_kernel(
     KV_HEAD_STRIDE: tl.constexpr,
     HEAD_SIZE: tl.constexpr,
     QUERY_GROUP_SIZE: tl.constexpr,
+    PADDED_QUERY_GROUP_SIZE: tl.constexpr,
     NUM_KV_HEADS: tl.constexpr,
     KV_BLOCK_SIZE: tl.constexpr,
     PARTITION_SIZE: tl.constexpr,
@@ -222,7 +224,7 @@ def _paged_attn_v2_kernel(
     _paged_attn_kernel(
         m_i_ptr, l_i_ptr, tmp_out_ptr, q_ptr, k_cache_ptr, v_cache_ptr, context_lens_ptr, block_tables_ptr,
         alibi_slopes_ptr, max_num_blocks_per_seq, attn_scale, USE_ALIBI, Q_STRIDE, KV_BLOCK_STRIDE,
-        KV_HEAD_STRIDE, HEAD_SIZE, QUERY_GROUP_SIZE, NUM_KV_HEADS, KV_BLOCK_SIZE, PARTITION_SIZE,
+        KV_HEAD_STRIDE, HEAD_SIZE, QUERY_GROUP_SIZE, PADDED_QUERY_GROUP_SIZE, NUM_KV_HEADS, KV_BLOCK_SIZE, PARTITION_SIZE,
     )
 
 
@@ -315,9 +317,14 @@ def paged_attention(
     kv_head_stride = key_cache.stride(1)
     use_alibi = alibi_slopes is not None
 
-    # FIXME: Remove this constraint.
+    if query_group_size == 1:
+        padded_group_size = 1
+    elif query_group_size < 16:
+        padded_group_size = 16
+    else:
+        padded_group_size = triton.next_power_of_2(query_group_size)
+    # FIXME: Remove these constraints.
     assert head_size in [64, 128, 256]
-    assert query_group_size in [1, 16, 32, 64, 128]
     assert kv_block_size in [16, 32, 64, 128, 256, 512]
 
     # TODO: Support ALiBi.
@@ -344,6 +351,7 @@ def paged_attention(
             kv_head_stride,
             head_size,
             query_group_size,
+            padded_group_size,
             num_kv_heads,
             kv_block_size,
         )
@@ -377,6 +385,7 @@ def paged_attention(
             kv_head_stride,
             head_size,
             query_group_size,
+            padded_group_size,
             num_kv_heads,
             kv_block_size,
             v2_partition_size,
