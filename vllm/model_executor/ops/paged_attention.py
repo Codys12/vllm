@@ -325,7 +325,7 @@ def paged_attention(
         padded_group_size = triton.next_power_of_2(query_group_size)
     # FIXME: Remove these constraints.
     assert head_size in [64, 128, 256]
-    assert kv_block_size in [16, 32, 64, 128, 256, 512]
+    assert kv_block_size >= 16
 
     # TODO: Support ALiBi.
     assert not use_alibi
