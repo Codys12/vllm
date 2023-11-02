@@ -317,7 +317,9 @@ def paged_attention(
     kv_head_stride = key_cache.stride(1)
     use_alibi = alibi_slopes is not None
 
-    if query_group_size < 16:
+    if query_group_size == 1:
+        padded_group_size = 1
+    elif query_group_size < 16:
         padded_group_size = 16
     else:
         padded_group_size = triton.next_power_of_2(query_group_size)
