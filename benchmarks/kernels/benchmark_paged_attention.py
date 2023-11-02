@@ -5,6 +5,7 @@ import time
 import torch
 
 from vllm import attention_ops
+from vllm.model_executor.ops.paged_attention import paged_attention
 
 NUM_BLOCKS = 1024
 PARTITION_SIZE = 512
@@ -53,21 +54,19 @@ def main(
 
     # Create the block tables.
     max_num_blocks_per_seq = (max_context_len + block_size - 1) // block_size
-    block_tables = []
-    for _ in range(num_seqs):
-        block_table = [
-            random.randint(0, NUM_BLOCKS - 1)
-            for _ in range(max_num_blocks_per_seq)
-        ]
-        block_tables.append(block_table)
-    block_tables = torch.tensor(block_tables, dtype=torch.int, device="cuda")
+    block_tables = torch.randint(0, NUM_BLOCKS, (num_seqs, max_num_blocks_per_seq), dtype=torch.int, device="cuda")
 
     # Create the KV cache.
-    x = 16 // torch.tensor([], dtype=dtype).element_size()
-    key_cache_shape = (NUM_BLOCKS, num_kv_heads, head_size // x, block_size, x)
+    if version.startswith("triton"):
+        key_cache_shape = (NUM_BLOCKS, num_kv_heads, block_size, head_size)
+        value_cache_shape = key_cache_shape
+    else:
+        x = 16 // torch.tensor([], dtype=dtype).element_size()
+        key_cache_shape = (NUM_BLOCKS, num_kv_heads, head_size // x, block_size, x)
+        value_cache_shape = (NUM_BLOCKS, num_kv_heads, head_size, block_size)
+
     key_cache = torch.empty(size=key_cache_shape, dtype=dtype, device="cuda")
     key_cache.uniform_(-scale, scale)
-    value_cache_shape = (NUM_BLOCKS, num_kv_heads, head_size, block_size)
     value_cache = torch.empty(size=value_cache_shape,
                               dtype=dtype,
                               device="cuda")
@@ -95,6 +94,10 @@ def main(
         if profile:
             torch.cuda.cudart().cudaProfilerStart()
         start_time = time.perf_counter()
+        triton_impl_versions = {
+            "triton-v1": 1,
+            "triton-v2": 2,
+        }
 
         for _ in range(num_iters):
             if version == "v1":
@@ -128,6 +131,20 @@ def main(
                     max_context_len,
                     alibi_slopes,
                 )
+            elif version in triton_impl_versions:
+                paged_attention(
+                    output,
+                    query,
+                    key_cache,
+                    value_cache,
+                    context_lens,
+                    block_tables,
+                    alibi_slopes,
+                    scale,
+                    max_context_len,
+                    v2_partition_size=PARTITION_SIZE,
+                    version=triton_impl_versions[version],
+                )
             else:
                 raise ValueError(f"Invalid version: {version}")
         torch.cuda.synchronize()
@@ -154,7 +171,7 @@ if __name__ == '__main__':
         description="Benchmark the paged attention kernel.")
     parser.add_argument("--version",
                         type=str,
-                        choices=["v1", "v2"],
+                        choices=["v1", "v2", "triton-v1", "triton-v2"],
                         default="v2")
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--context-len", type=int, default=4096)
