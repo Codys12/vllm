@@ -211,7 +211,6 @@ def _paged_attn_v2_reduce_kernel(
     context_len = tl.load(context_lens_ptr + seq_idx)
     num_partitions = tl.cdiv(context_len, PARTITION_SIZE)
     group_head_offset = tl.arange(0, QUERY_GROUP_SIZE)[:, None] * HEAD_SIZE + tl.arange(0, HEAD_SIZE)[None, :]
-
     if num_partitions == 1:
         # No reduction needed. Only copy tmp_out to out.
         tmp_out_offset = (seq_idx * NUM_KV_HEADS + kv_head_idx) * max_num_partitions * QUERY_GROUP_SIZE * HEAD_SIZE
@@ -237,8 +236,23 @@ def _paged_attn_v2_reduce_kernel(
     l_i *= tl.exp(m_i - m[None, :])
     # l: [QUERY_GROUP_SIZE]
     l = tl.sum(l_i, axis=0)
+    # r: [NUM_PARTITIONS, QUERY_GROUP_SIZE]
+    r = l_i / l[None, :]
 
     # Aggregate tmp_out to out.
+    tmp_out_offset = (seq_idx * NUM_KV_HEADS + kv_head_idx) * max_num_partitions * QUERY_GROUP_SIZE * HEAD_SIZE
+    tmp_out_offset += tl.arange(0, NUM_PARTITIONS)[:, None, None] * QUERY_GROUP_SIZE * HEAD_SIZE
+    tmp_out_offset += tl.arange(0, QUERY_GROUP_SIZE)[None, :, None] * HEAD_SIZE
+    tmp_out_offset += tl.arange(0, HEAD_SIZE)[None, None, :]
+    # tmp_out: [NUM_PARTITIONS, QUERY_GROUP_SIZE, HEAD_SIZE]
+    tmp_out = tl.load(tmp_out_ptr + tmp_out_offset, mask=mask[:, :, None], other=0.0)
+    # out: [QUERY_GROUP_SIZE, HEAD_SIZE]
+    out = tl.sum((tmp_out * r[:, :, None]).to(tl.float32), axis=0)
+
+    # Store out.
+    out_offset = (seq_idx * NUM_KV_HEADS + kv_head_idx) * QUERY_GROUP_SIZE * HEAD_SIZE
+    out_offset += group_head_offset
+    tl.store(out_ptr + out_offset, out)
 
 
 def paged_attention(
@@ -252,6 +266,7 @@ def paged_attention(
     attn_scale: float,
     max_context_len: int,
     v2_partition_size: int = 512,
+    version: Optional[int] = None,
 ) -> None:
     num_seqs = query.shape[0]
     num_kv_heads = key_cache.shape[1]
@@ -264,13 +279,14 @@ def paged_attention(
     kv_head_stride = key_cache.stride(1)
     use_alibi = alibi_slopes is not None
 
-    # TEMP
+    # TODO: Support ALiBi.
     assert not use_alibi
-
     # TODO: Tune num_warps and num_stages.
+
     max_num_partitions = triton.cdiv(max_context_len, v2_partition_size)
     grid = (num_seqs, num_kv_heads, max_num_partitions)
-    if max_num_partitions == 1:
+    use_v1 = version == 1 or max_num_partitions == 1
+    if use_v1:
         _paged_attn_v1_kernel[grid](
             out,
             query,
@@ -422,7 +438,7 @@ if __name__ == '__main__':
     NUM_BLOCKS = 7000
     HEAD_SIZE = 64
     KV_BLOCK_SIZE = 16
-    MAX_SEQ_LEN = 1024
+    MAX_SEQ_LEN = 16 * 1024
     CONTEXT_LENS = [random.randint(1, MAX_SEQ_LEN) for _ in range(NUM_SEQS)]
     MAX_NUM_BLOCKS_PER_SEQ = (max(CONTEXT_LENS) + KV_BLOCK_SIZE - 1) // KV_BLOCK_SIZE
 
