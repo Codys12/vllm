@@ -224,14 +224,18 @@ def _paged_attn_v2_reduce_kernel(
 
     # Get the global max logit.
     offset = (seq_idx * NUM_KV_HEADS + kv_head_idx) * max_num_partitions * QUERY_GROUP_SIZE
-    offset += tl.arange(0, NUM_PARTITIONS)[None, :] * QUERY_GROUP_SIZE + tl.arange(0, QUERY_GROUP_SIZE)[:, None]
-    mask = tl.arange(0, NUM_PARTITIONS)[None, :] < num_partitions
+    offset += tl.arange(0, NUM_PARTITIONS)[:, None] * QUERY_GROUP_SIZE + tl.arange(0, QUERY_GROUP_SIZE)[None, :]
+    mask = tl.arange(0, NUM_PARTITIONS)[:, None] < num_partitions
+    # m_i: [NUM_PARTITIONS, QUERY_GROUP_SIZE]
     m_i = tl.load(m_i_ptr + offset, mask=mask, other=float("-inf"))
+    # m: [QUERY_GROUP_SIZE]
     m = tl.max(m_i, axis=0)
 
     # Rescale the exp sums and compute the global sum.
+    # l_i: [NUM_PARTITIONS, QUERY_GROUP_SIZE]
     l_i = tl.load(l_i_ptr + offset, mask=mask, other=0.0)
     l_i *= tl.exp(m_i - m[None, :])
+    # l: [QUERY_GROUP_SIZE]
     l = tl.sum(l_i, axis=0)
 
     # Aggregate tmp_out to out.
@@ -418,7 +422,7 @@ if __name__ == '__main__':
     NUM_BLOCKS = 7000
     HEAD_SIZE = 64
     KV_BLOCK_SIZE = 16
-    MAX_SEQ_LEN = 512
+    MAX_SEQ_LEN = 1024
     CONTEXT_LENS = [random.randint(1, MAX_SEQ_LEN) for _ in range(NUM_SEQS)]
     MAX_NUM_BLOCKS_PER_SEQ = (max(CONTEXT_LENS) + KV_BLOCK_SIZE - 1) // KV_BLOCK_SIZE
 
