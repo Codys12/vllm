@@ -118,7 +118,7 @@ def _paged_attn_mha_kernel(
 
 # Grid: (num_seqs, NUM_KV_HEADS, max_num_partitions)
 @triton.jit
-def _paged_attn_kernel(
+def _paged_attn_gqa_kernel(
     m_i_ptr,                                 # [num_seqs, NUM_KV_HEADS, max_num_partitions, QUERY_GROUP_SIZE]
     l_i_ptr,                                 # [num_seqs, NUM_KV_HEADS, max_num_partitions, QUERY_GROUP_SIZE]
     out_ptr,                                 # [num_seqs, NUM_KV_HEADS, max_num_partitions, QUERY_GROUP_SIZE, HEAD_SIZE]
@@ -186,18 +186,8 @@ def _paged_attn_kernel(
         key = tl.load(k_cache_ptr + kv_offset, mask=kv_mask, other=0.0)
 
         # Compute attention.
-        if PADDED_QUERY_GROUP_SIZE == 1:
-            # MHA.
-            # query: [1, HEAD_SIZE]
-            # qk: [KV_BLOCK_SIZE, HEAD_SIZE]
-            qk = query * key
-            # qk: [1, KV_BLOCK_SIZE]
-            qk = tl.sum(qk.to(tl.float32), axis=1)[None, :]
-        else:
-            # MQA/GQA.
-            # qk: [PADDED_QUERY_GROUP_SIZE, KV_BLOCK_SIZE]
-            qk = tl.dot(query, key.T, out_dtype=tl.float32)
         # qk: [PADDED_QUERY_GROUP_SIZE, KV_BLOCK_SIZE]
+        qk = tl.dot(query, key.T, out_dtype=tl.float32)
         qk *= attn_scale
         qk = tl.where(start_idx + tl.arange(0, KV_BLOCK_SIZE) < context_len, qk, float("-inf"))
 
@@ -218,12 +208,7 @@ def _paged_attn_kernel(
         value = tl.load(v_cache_ptr + kv_offset, mask=kv_mask, other=0.0)
 
         p = p.to(value.dtype)
-        if PADDED_QUERY_GROUP_SIZE == 1:
-            # MHA.
-            acc += tl.sum((p.T * value).to(tl.float32), axis=0)[None, :]
-        else:
-            # MQA/GQA.
-            acc += tl.dot(p, value, out_dtype=tl.float32)
+        acc += tl.dot(p, value, out_dtype=tl.float32)
 
         l_i = l_i * alpha + tl.sum(p, axis=1)
         m_i = m_i_new
@@ -294,7 +279,7 @@ def _paged_attn_v1_kernel(
         )
     else:
         # NOTE: The first two inputs are unused.
-        _paged_attn_kernel(
+        _paged_attn_gqa_kernel(
             out_ptr, out_ptr, out_ptr, q_ptr, k_cache_ptr, v_cache_ptr, context_lens_ptr, block_tables_ptr,
             alibi_slopes_ptr, max_num_blocks_per_seq, attn_scale, USE_ALIBI, Q_STRIDE, KV_BLOCK_STRIDE,
             KV_HEAD_STRIDE, HEAD_SIZE, QUERY_GROUP_SIZE, PADDED_QUERY_GROUP_SIZE, NUM_KV_HEADS, KV_BLOCK_SIZE, PARTITION_SIZE=0,
@@ -333,7 +318,7 @@ def _paged_attn_v2_kernel(
             KV_HEAD_STRIDE, HEAD_SIZE, NUM_KV_HEADS, KV_BLOCK_SIZE, PARTITION_SIZE,
         )
     else:
-        _paged_attn_kernel(
+        _paged_attn_gqa_kernel(
             m_i_ptr, l_i_ptr, tmp_out_ptr, q_ptr, k_cache_ptr, v_cache_ptr, context_lens_ptr, block_tables_ptr,
             alibi_slopes_ptr, max_num_blocks_per_seq, attn_scale, USE_ALIBI, Q_STRIDE, KV_BLOCK_STRIDE,
             KV_HEAD_STRIDE, HEAD_SIZE, QUERY_GROUP_SIZE, PADDED_QUERY_GROUP_SIZE, NUM_KV_HEADS, KV_BLOCK_SIZE, PARTITION_SIZE,
@@ -598,7 +583,7 @@ if __name__ == '__main__':
 
     NUM_SEQS = 32
     NUM_KV_HEADS = 8
-    QUERY_GROUP_SIZE = 1
+    QUERY_GROUP_SIZE = 16
     NUM_BLOCKS = 7000
     HEAD_SIZE = 128
     KV_BLOCK_SIZE = 16
