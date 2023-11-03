@@ -93,28 +93,14 @@ def _paged_attn_kernel(
         # Compute m, l, and p.
         # m_ij: [PADDED_QUERY_GROUP_SIZE]
         m_ij = tl.max(qk, axis=1)
-        # p: [PADDED_QUERY_GROUP_SIZE, KV_BLOCK_SIZE]
-        p = tl.exp(qk - m_ij[:, None])
-        # l_ij: [PADDED_QUERY_GROUP_SIZE]
-        l_ij = tl.sum(p, axis=1)
         # m_i_new: [PADDED_QUERY_GROUP_SIZE]
         m_i_new = tl.maximum(m_i, m_ij)
+
+        # p: [PADDED_QUERY_GROUP_SIZE, KV_BLOCK_SIZE]
+        p = tl.exp(qk - m_i_new[:, None])
         # alpha: [PADDED_QUERY_GROUP_SIZE]
         alpha = tl.exp(m_i - m_i_new)
-        # beta: [PADDED_QUERY_GROUP_SIZE]
-        beta = tl.exp(m_ij - m_i_new)
-        # l_i_new: [PADDED_QUERY_GROUP_SIZE]
-        l_i_new = alpha * l_i + beta * l_ij
-
-        # Update accumulators.
-        # p_scale: [PADDED_QUERY_GROUP_SIZE]
-        p_scale = beta / l_i_new
-        # p: [PADDED_QUERY_GROUP_SIZE, KV_BLOCK_SIZE]
-        p = p * p_scale[:, None]
-        # acc_scale: [PADDED_QUERY_GROUP_SIZE]
-        acc_scale = l_i / l_i_new * alpha
-        # acc: [PADDED_QUERY_GROUP_SIZE, HEAD_SIZE]
-        acc = acc * acc_scale[:, None]
+        acc *= alpha[:, None]
 
         # Load a value block.
         # value: [KV_BLOCK_SIZE, HEAD_SIZE]
@@ -126,11 +112,11 @@ def _paged_attn_kernel(
             acc += tl.sum((p.T * value).to(tl.float32), axis=0)[None, :]
         else:
             # MQA/GQA.
-            acc += tl.dot(p, value)
+            acc += tl.dot(p, value, out_dtype=tl.float32)
 
-        # Update m and l.
+        l_i = l_i * alpha + tl.sum(p, axis=1)
         m_i = m_i_new
-        l_i = l_i_new
+    acc = acc / l_i[:, None]
 
     # Store the current partition's m and l for later reduction.
     if USE_PARTITIONING:
@@ -483,12 +469,12 @@ if __name__ == '__main__':
     torch.cuda.manual_seed(SEED)
 
     NUM_SEQS = 32
-    NUM_KV_HEADS = 12
-    QUERY_GROUP_SIZE = 1
+    NUM_KV_HEADS = 8
+    QUERY_GROUP_SIZE = 8
     NUM_BLOCKS = 7000
-    HEAD_SIZE = 64
+    HEAD_SIZE = 128
     KV_BLOCK_SIZE = 16
-    MAX_SEQ_LEN = 16 * 1024
+    MAX_SEQ_LEN = 512
     CONTEXT_LENS = [random.randint(1, MAX_SEQ_LEN) for _ in range(NUM_SEQS)]
     MAX_NUM_BLOCKS_PER_SEQ = (max(CONTEXT_LENS) + KV_BLOCK_SIZE - 1) // KV_BLOCK_SIZE
 
