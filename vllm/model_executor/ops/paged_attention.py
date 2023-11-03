@@ -57,19 +57,15 @@ def _paged_attn_mha_kernel(
     l_i = 0.0
     acc = tl.zeros([HEAD_SIZE], dtype=tl.float32)
 
-    context_start_idx = tl.multiple_of(context_start_idx, KV_BLOCK_SIZE)
-    start_block_idx = context_start_idx // KV_BLOCK_SIZE
-    num_blocks = tl.cdiv(context_end_idx - context_start_idx, KV_BLOCK_SIZE)
-    offset = context_start_idx + tl.arange(0, KV_BLOCK_SIZE)
-    for i in range(0, num_blocks, 1):
-        block_idx = start_block_idx + i
+    for start_idx in range(context_start_idx, context_end_idx, KV_BLOCK_SIZE):
+        start_idx = tl.multiple_of(start_idx, KV_BLOCK_SIZE)
+        block_idx = start_idx // KV_BLOCK_SIZE
         block_number = tl.load(block_tables_ptr + seq_idx * max_num_blocks_per_seq + block_idx)
 
         # Load a key block.
         kv_offset = block_number * KV_BLOCK_STRIDE + kv_head_idx * KV_HEAD_STRIDE
         kv_offset += tl.arange(0, KV_BLOCK_SIZE)[:, None] * HEAD_SIZE + tl.arange(0, HEAD_SIZE)[None, :]
-        mask_offset = offset + block_idx * KV_BLOCK_SIZE
-        kv_mask = mask_offset[:, None] < context_len
+        kv_mask = (start_idx + tl.arange(0, KV_BLOCK_SIZE)[:, None]) < context_len
         # key: [KV_BLOCK_SIZE, HEAD_SIZE]
         key = tl.load(k_cache_ptr + kv_offset, mask=kv_mask, other=0.0)
 
@@ -77,7 +73,7 @@ def _paged_attn_mha_kernel(
         # qk: [KV_BLOCK_SIZE]
         qk = tl.sum(query * key, axis=1)
         qk *= attn_scale
-        qk = tl.where(mask_offset < context_len, qk, float("-inf"))
+        qk = tl.where(start_idx + tl.arange(0, KV_BLOCK_SIZE) < context_len, qk, float("-inf"))
 
         # Compute m, l, and p.
         # m_ij: [1]
