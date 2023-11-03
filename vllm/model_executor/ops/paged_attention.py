@@ -45,10 +45,16 @@ def _paged_attn_mha_kernel(
         context_start_idx = 0
         context_end_idx = context_len
 
+    # Define offsets.
+    block_offset = tl.arange(0, KV_BLOCK_SIZE)
+    head_offset = tl.arange(0, HEAD_SIZE)
+    kv_offset = kv_head_idx * KV_HEAD_STRIDE
+    kv_offset += block_offset[:, None] * HEAD_SIZE + head_offset[None, :]
+
     # Load queries.
     query_offset = seq_idx * Q_STRIDE + kv_head_idx * HEAD_SIZE
     # NOTE(woosuk): Here we assume HEAD_SIZE is a power of 2.
-    query_offset += tl.arange(0, HEAD_SIZE)
+    query_offset += head_offset
     # query: [1, HEAD_SIZE]
     query = tl.load(q_ptr + query_offset)[None, :]
 
@@ -63,17 +69,17 @@ def _paged_attn_mha_kernel(
         block_number = tl.load(block_tables_ptr + seq_idx * max_num_blocks_per_seq + block_idx)
 
         # Load a key block.
-        kv_offset = block_number * KV_BLOCK_STRIDE + kv_head_idx * KV_HEAD_STRIDE
-        kv_offset += tl.arange(0, KV_BLOCK_SIZE)[:, None] * HEAD_SIZE + tl.arange(0, HEAD_SIZE)[None, :]
-        kv_mask = (start_idx + tl.arange(0, KV_BLOCK_SIZE)[:, None]) < context_len
+        kv_block_offset = block_number * KV_BLOCK_STRIDE + kv_offset
+        mask_offset = start_idx + block_offset
+        kv_mask = mask_offset[:, None] < context_len
         # key: [KV_BLOCK_SIZE, HEAD_SIZE]
-        key = tl.load(k_cache_ptr + kv_offset, mask=kv_mask, other=0.0)
+        key = tl.load(k_cache_ptr + kv_block_offset, mask=kv_mask, other=0.0)
 
         # Compute attention.
         # qk: [KV_BLOCK_SIZE]
         qk = tl.sum(query * key, axis=1)
         qk *= attn_scale
-        qk = tl.where(start_idx + tl.arange(0, KV_BLOCK_SIZE) < context_len, qk, float("-inf"))
+        qk = tl.where(mask_offset < context_len, qk, float("-inf"))
 
         # Compute m, l, and p.
         # m_ij: [1]
@@ -89,7 +95,7 @@ def _paged_attn_mha_kernel(
 
         # Load a value block.
         # value: [KV_BLOCK_SIZE, HEAD_SIZE]
-        value = tl.load(v_cache_ptr + kv_offset, mask=kv_mask, other=0.0)
+        value = tl.load(v_cache_ptr + kv_block_offset, mask=kv_mask, other=0.0)
         acc += tl.sum(p[:, None] * value, axis=0)
 
         l_i = l_i * alpha + tl.sum(p, axis=0)
@@ -106,7 +112,7 @@ def _paged_attn_mha_kernel(
     # NOTE: Unlike the query tensor, we assume the out tensor is contiguous.
     out_offset = (seq_idx * NUM_KV_HEADS + kv_head_idx) * max_num_partitions * HEAD_SIZE
     out_offset += partition_idx * HEAD_SIZE
-    out_offset += tl.arange(0, HEAD_SIZE)
+    out_offset += head_offset
     tl.store(out_ptr + out_offset, acc)
 
 
