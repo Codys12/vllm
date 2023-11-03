@@ -47,13 +47,13 @@ def _paged_attn_mha_kernel(
 
     # Define offsets.
     block_offset = tl.arange(0, KV_BLOCK_SIZE)
+    # NOTE(woosuk): Here we assume HEAD_SIZE is a power of 2.
     head_offset = tl.arange(0, HEAD_SIZE)
     kv_offset = kv_head_idx * KV_HEAD_STRIDE
     kv_offset += block_offset[:, None] * HEAD_SIZE + head_offset[None, :]
 
     # Load queries.
     query_offset = seq_idx * Q_STRIDE + kv_head_idx * HEAD_SIZE
-    # NOTE(woosuk): Here we assume HEAD_SIZE is a power of 2.
     query_offset += head_offset
     # query: [1, HEAD_SIZE]
     query = tl.load(q_ptr + query_offset)[None, :]
