@@ -7,6 +7,115 @@ import triton.language as tl
 
 # Grid: (num_seqs, NUM_KV_HEADS, max_num_partitions)
 @triton.jit
+def _paged_attn_mha_kernel(
+    m_i_ptr,                                 # [num_seqs, NUM_KV_HEADS, max_num_partitions]
+    l_i_ptr,                                 # [num_seqs, NUM_KV_HEADS, max_num_partitions]
+    out_ptr,                                 # [num_seqs, NUM_KV_HEADS, max_num_partitions, HEAD_SIZE]
+    q_ptr,                                   # [num_seqs, NUM_KV_HEADS, HEAD_SIZE]
+    k_cache_ptr,                             # [num_blocks, NUM_KV_HEADS, KV_BLOCK_SIZE, HEAD_SIZE]
+    v_cache_ptr,                             # [num_blocks, NUM_KV_HEADS, KV_BLOCK_SIZE, HEAD_SIZE]
+    context_lens_ptr,                        # [num_seqs]
+    block_tables_ptr,                        # [num_seqs, max_num_blocks_per_seq]
+    alibi_slopes_ptr,                        # [NUM_KV_HEADS]
+    max_num_blocks_per_seq,
+    attn_scale,
+    USE_ALIBI: tl.constexpr,
+    Q_STRIDE: tl.constexpr,
+    KV_BLOCK_STRIDE: tl.constexpr,
+    KV_HEAD_STRIDE: tl.constexpr,
+    HEAD_SIZE: tl.constexpr,
+    NUM_KV_HEADS: tl.constexpr,
+    KV_BLOCK_SIZE: tl.constexpr,
+    PARTITION_SIZE: tl.constexpr,
+):
+    seq_idx = tl.program_id(0)
+    kv_head_idx = tl.program_id(1)
+    partition_idx = tl.program_id(2)
+    max_num_partitions = tl.num_programs(2)
+
+    USE_PARTITIONING = PARTITION_SIZE > 0
+    context_len = tl.load(context_lens_ptr + seq_idx)
+    # This block processes [context_start_idx, context_end_idx).
+    if USE_PARTITIONING:
+        context_start_idx = partition_idx * PARTITION_SIZE
+        if context_start_idx >= context_len:
+            return
+        context_end_idx = tl.minimum(context_start_idx + PARTITION_SIZE, context_len)
+    else:
+        context_start_idx = 0
+        context_end_idx = context_len
+
+    # Load queries.
+    query_offset = seq_idx * Q_STRIDE + kv_head_idx * HEAD_SIZE
+    # NOTE(woosuk): Here we assume HEAD_SIZE is a power of 2.
+    query_offset += tl.arange(0, HEAD_SIZE)
+    # query: [1, HEAD_SIZE]
+    query = tl.load(q_ptr + query_offset)[None, :]
+
+    # Initialize accumulators.
+    m_i = -float("inf")
+    l_i = 0.0
+    acc = tl.zeros([HEAD_SIZE], dtype=tl.float32)
+
+    context_start_idx = tl.multiple_of(context_start_idx, KV_BLOCK_SIZE)
+    start_block_idx = context_start_idx // KV_BLOCK_SIZE
+    num_blocks = tl.cdiv(context_end_idx - context_start_idx, KV_BLOCK_SIZE)
+    offset = context_start_idx + tl.arange(0, KV_BLOCK_SIZE)
+    for i in range(0, num_blocks, 1):
+        block_idx = start_block_idx + i
+        block_number = tl.load(block_tables_ptr + seq_idx * max_num_blocks_per_seq + block_idx)
+
+        # Load a key block.
+        kv_offset = block_number * KV_BLOCK_STRIDE + kv_head_idx * KV_HEAD_STRIDE
+        kv_offset += tl.arange(0, KV_BLOCK_SIZE)[:, None] * HEAD_SIZE + tl.arange(0, HEAD_SIZE)[None, :]
+        mask_offset = offset + block_idx * KV_BLOCK_SIZE
+        kv_mask = mask_offset[:, None] < context_len
+        # key: [KV_BLOCK_SIZE, HEAD_SIZE]
+        key = tl.load(k_cache_ptr + kv_offset, mask=kv_mask, other=0.0)
+
+        # Compute attention.
+        # qk: [KV_BLOCK_SIZE]
+        qk = tl.sum(query * key, axis=1)
+        qk *= attn_scale
+        qk = tl.where(mask_offset < context_len, qk, float("-inf"))
+
+        # Compute m, l, and p.
+        # m_ij: [1]
+        m_ij = tl.max(qk, axis=0)
+        # m_i_new: [1]
+        m_i_new = tl.maximum(m_i, m_ij)
+
+        # p: [KV_BLOCK_SIZE]
+        p = tl.exp(qk - m_i_new)
+        # alpha: [1]
+        alpha = tl.exp(m_i - m_i_new)
+        acc *= alpha
+
+        # Load a value block.
+        # value: [KV_BLOCK_SIZE, HEAD_SIZE]
+        value = tl.load(v_cache_ptr + kv_offset, mask=kv_mask, other=0.0)
+        acc += tl.sum(p[:, None] * value, axis=0)
+
+        l_i = l_i * alpha + tl.sum(p, axis=0)
+        m_i = m_i_new
+    acc = acc / l_i
+
+    # Store the current partition's m and l for later reduction.
+    if USE_PARTITIONING:
+        partition_offset = (seq_idx * NUM_KV_HEADS + kv_head_idx) * max_num_partitions
+        partition_offset += partition_idx
+        tl.store(m_i_ptr + partition_offset, m_i)
+        tl.store(l_i_ptr + partition_offset, l_i)
+
+    # NOTE: Unlike the query tensor, we assume the out tensor is contiguous.
+    out_offset = (seq_idx * NUM_KV_HEADS + kv_head_idx) * max_num_partitions * HEAD_SIZE
+    out_offset += partition_idx * HEAD_SIZE
+    out_offset += tl.arange(0, HEAD_SIZE)
+    tl.store(out_ptr + out_offset, acc)
+
+
+# Grid: (num_seqs, NUM_KV_HEADS, max_num_partitions)
+@triton.jit
 def _paged_attn_kernel(
     m_i_ptr,                                 # [num_seqs, NUM_KV_HEADS, max_num_partitions, QUERY_GROUP_SIZE]
     l_i_ptr,                                 # [num_seqs, NUM_KV_HEADS, max_num_partitions, QUERY_GROUP_SIZE]
@@ -175,11 +284,18 @@ def _paged_attn_v1_kernel(
     KV_BLOCK_SIZE: tl.constexpr,
 ):
     # NOTE: The first two inputs are unused.
-    _paged_attn_kernel(
-        out_ptr, out_ptr, out_ptr, q_ptr, k_cache_ptr, v_cache_ptr, context_lens_ptr, block_tables_ptr,
-        alibi_slopes_ptr, max_num_blocks_per_seq, attn_scale, USE_ALIBI, Q_STRIDE, KV_BLOCK_STRIDE,
-        KV_HEAD_STRIDE, HEAD_SIZE, QUERY_GROUP_SIZE, PADDED_QUERY_GROUP_SIZE, NUM_KV_HEADS, KV_BLOCK_SIZE, PARTITION_SIZE=0,
-    )
+    if PADDED_QUERY_GROUP_SIZE == 1:
+        _paged_attn_mha_kernel(
+            out_ptr, out_ptr, out_ptr, q_ptr, k_cache_ptr, v_cache_ptr, context_lens_ptr, block_tables_ptr,
+            alibi_slopes_ptr, max_num_blocks_per_seq, attn_scale, USE_ALIBI, Q_STRIDE, KV_BLOCK_STRIDE,
+            KV_HEAD_STRIDE, HEAD_SIZE, NUM_KV_HEADS, KV_BLOCK_SIZE, PARTITION_SIZE=0,
+        )
+    else:
+        _paged_attn_kernel(
+            out_ptr, out_ptr, out_ptr, q_ptr, k_cache_ptr, v_cache_ptr, context_lens_ptr, block_tables_ptr,
+            alibi_slopes_ptr, max_num_blocks_per_seq, attn_scale, USE_ALIBI, Q_STRIDE, KV_BLOCK_STRIDE,
+            KV_HEAD_STRIDE, HEAD_SIZE, QUERY_GROUP_SIZE, PADDED_QUERY_GROUP_SIZE, NUM_KV_HEADS, KV_BLOCK_SIZE, PARTITION_SIZE=0,
+        )
 
 
 # Grid: (num_seqs, NUM_KV_HEADS, max_num_partitions)
@@ -312,6 +428,7 @@ def paged_attention(
     # FIXME: Remove these constraints.
     assert head_size in [64, 128, 256]
     assert kv_block_size >= 16
+    assert query_group_size in [1, 2, 4, 8, 16, 32, 64, 128, 256]
 
     # TODO: Support ALiBi.
     assert not use_alibi
@@ -470,7 +587,7 @@ if __name__ == '__main__':
 
     NUM_SEQS = 32
     NUM_KV_HEADS = 8
-    QUERY_GROUP_SIZE = 8
+    QUERY_GROUP_SIZE = 1
     NUM_BLOCKS = 7000
     HEAD_SIZE = 128
     KV_BLOCK_SIZE = 16
