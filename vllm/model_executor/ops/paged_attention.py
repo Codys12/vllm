@@ -285,14 +285,15 @@ def _paged_attn_v1_kernel(
     NUM_KV_HEADS: tl.constexpr,
     KV_BLOCK_SIZE: tl.constexpr,
 ):
-    # NOTE: The first two inputs are unused.
     if PADDED_QUERY_GROUP_SIZE == 1:
+        # NOTE: The first two inputs are unused.
         _paged_attn_mha_kernel(
             out_ptr, out_ptr, out_ptr, q_ptr, k_cache_ptr, v_cache_ptr, context_lens_ptr, block_tables_ptr,
             alibi_slopes_ptr, max_num_blocks_per_seq, attn_scale, USE_ALIBI, Q_STRIDE, KV_BLOCK_STRIDE,
             KV_HEAD_STRIDE, HEAD_SIZE, NUM_KV_HEADS, KV_BLOCK_SIZE, PARTITION_SIZE=0,
         )
     else:
+        # NOTE: The first two inputs are unused.
         _paged_attn_kernel(
             out_ptr, out_ptr, out_ptr, q_ptr, k_cache_ptr, v_cache_ptr, context_lens_ptr, block_tables_ptr,
             alibi_slopes_ptr, max_num_blocks_per_seq, attn_scale, USE_ALIBI, Q_STRIDE, KV_BLOCK_STRIDE,
@@ -325,13 +326,21 @@ def _paged_attn_v2_kernel(
     KV_BLOCK_SIZE: tl.constexpr,
     PARTITION_SIZE: tl.constexpr,
 ):
-    _paged_attn_kernel(
-        m_i_ptr, l_i_ptr, tmp_out_ptr, q_ptr, k_cache_ptr, v_cache_ptr, context_lens_ptr, block_tables_ptr,
-        alibi_slopes_ptr, max_num_blocks_per_seq, attn_scale, USE_ALIBI, Q_STRIDE, KV_BLOCK_STRIDE,
-        KV_HEAD_STRIDE, HEAD_SIZE, QUERY_GROUP_SIZE, PADDED_QUERY_GROUP_SIZE, NUM_KV_HEADS, KV_BLOCK_SIZE, PARTITION_SIZE,
-    )
+    if PADDED_QUERY_GROUP_SIZE == 1:
+        _paged_attn_mha_kernel(
+            m_i_ptr, l_i_ptr, tmp_out_ptr, q_ptr, k_cache_ptr, v_cache_ptr, context_lens_ptr, block_tables_ptr,
+            alibi_slopes_ptr, max_num_blocks_per_seq, attn_scale, USE_ALIBI, Q_STRIDE, KV_BLOCK_STRIDE,
+            KV_HEAD_STRIDE, HEAD_SIZE, NUM_KV_HEADS, KV_BLOCK_SIZE, PARTITION_SIZE,
+        )
+    else:
+        _paged_attn_kernel(
+            m_i_ptr, l_i_ptr, tmp_out_ptr, q_ptr, k_cache_ptr, v_cache_ptr, context_lens_ptr, block_tables_ptr,
+            alibi_slopes_ptr, max_num_blocks_per_seq, attn_scale, USE_ALIBI, Q_STRIDE, KV_BLOCK_STRIDE,
+            KV_HEAD_STRIDE, HEAD_SIZE, QUERY_GROUP_SIZE, PADDED_QUERY_GROUP_SIZE, NUM_KV_HEADS, KV_BLOCK_SIZE, PARTITION_SIZE,
+        )
 
 
+# TODO: Support QUERY_GROUP_SIZE that is not a power of 2.
 # Grid: (num_seqs, NUM_KV_HEADS)
 @triton.jit
 def _paged_attn_v2_reduce_kernel(
