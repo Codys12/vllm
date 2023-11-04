@@ -40,8 +40,7 @@ def _paged_attn_mha_kernel(
         context_start_idx = partition_idx * PARTITION_SIZE
         if context_start_idx >= context_len:
             return
-        # num_blocks = tl.cdiv(context_len - context_start_idx, KV_BLOCK_SIZE)
-        num_blocks = PARTITION_SIZE // KV_BLOCK_SIZE
+        num_blocks = tl.cdiv(context_len - context_start_idx, KV_BLOCK_SIZE)
     else:
         context_start_idx = 0
         num_blocks = tl.cdiv(context_len, KV_BLOCK_SIZE)
@@ -64,15 +63,15 @@ def _paged_attn_mha_kernel(
     l_i = 0.0
     acc = tl.zeros([HEAD_SIZE], dtype=tl.float32)
 
-    for start_idx in range(num_blocks):
-        start_idx = context_start_idx + start_idx * KV_BLOCK_SIZE
-        start_idx = tl.multiple_of(start_idx, KV_BLOCK_SIZE)
-        block_idx = start_idx // KV_BLOCK_SIZE
+    NUM_BLOCKS_PER_PARTITION = PARTITION_SIZE // KV_BLOCK_SIZE
+    num_prev_blocks = partition_idx * NUM_BLOCKS_PER_PARTITION
+    for i in range(num_blocks):
+        block_idx = num_prev_blocks + i
         block_number = tl.load(block_tables_ptr + seq_idx * max_num_blocks_per_seq + block_idx)
 
         # Load a key block.
         kv_block_offset = block_number * KV_BLOCK_STRIDE + kv_offset
-        mask_offset = start_idx + block_offset
+        mask_offset = block_idx * KV_BLOCK_SIZE + block_offset
         kv_mask = mask_offset[:, None] < context_len
         # key: [KV_BLOCK_SIZE, HEAD_SIZE]
         key = tl.load(k_cache_ptr + kv_block_offset, mask=kv_mask, other=0.0)
@@ -441,7 +440,7 @@ def paged_attention(
     else:
         padded_group_size = triton.next_power_of_2(query_group_size)
     # FIXME: Remove these constraints.
-    assert head_size in [64, 128, 256]
+    assert head_size in [64, 128, 256], f"head_size={head_size}"
     assert kv_block_size >= 16
     assert query_group_size in [1, 2, 4, 8, 16, 32, 64, 128, 256]
 
