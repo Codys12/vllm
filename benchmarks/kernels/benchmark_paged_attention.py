@@ -8,7 +8,7 @@ from vllm import attention_ops
 from vllm.model_executor.ops.paged_attention import paged_attention
 
 NUM_BLOCKS = 1024
-PARTITION_SIZE = 512
+V2_PARTITION_SIZE = 512
 
 
 @torch.inference_mode()
@@ -75,8 +75,8 @@ def main(
     # Prepare for the paged attention kernel.
     output = torch.empty_like(query)
     if version == "v2":
-        num_partitions = ((max_context_len + PARTITION_SIZE - 1) //
-                          PARTITION_SIZE)
+        num_partitions = ((max_context_len + V2_PARTITION_SIZE - 1) //
+                          V2_PARTITION_SIZE)
         tmp_output = torch.empty(
             size=(num_seqs, num_query_heads, num_partitions, head_size),
             dtype=output.dtype,
@@ -142,7 +142,7 @@ def main(
                     alibi_slopes,
                     scale,
                     max_context_len,
-                    v2_partition_size=PARTITION_SIZE,
+                    v2_partition_size=V2_PARTITION_SIZE,
                     version=triton_impl_versions[version],
                 )
             else:
