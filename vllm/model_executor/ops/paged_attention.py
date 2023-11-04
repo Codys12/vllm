@@ -40,10 +40,11 @@ def _paged_attn_mha_kernel(
         context_start_idx = partition_idx * PARTITION_SIZE
         if context_start_idx >= context_len:
             return
-        context_end_idx = tl.minimum(context_start_idx + PARTITION_SIZE, context_len)
+        # num_blocks = tl.cdiv(context_len - context_start_idx, KV_BLOCK_SIZE)
+        num_blocks = PARTITION_SIZE // KV_BLOCK_SIZE
     else:
         context_start_idx = 0
-        context_end_idx = context_len
+        num_blocks = tl.cdiv(context_len, KV_BLOCK_SIZE)
 
     # Define offsets.
     block_offset = tl.arange(0, KV_BLOCK_SIZE)
@@ -63,7 +64,8 @@ def _paged_attn_mha_kernel(
     l_i = 0.0
     acc = tl.zeros([HEAD_SIZE], dtype=tl.float32)
 
-    for start_idx in range(context_start_idx, context_end_idx, KV_BLOCK_SIZE):
+    for start_idx in range(num_blocks):
+        start_idx = context_start_idx + start_idx * KV_BLOCK_SIZE
         start_idx = tl.multiple_of(start_idx, KV_BLOCK_SIZE)
         block_idx = start_idx // KV_BLOCK_SIZE
         block_number = tl.load(block_tables_ptr + seq_idx * max_num_blocks_per_seq + block_idx)
@@ -287,6 +289,23 @@ def _paged_attn_v1_kernel(
 
 
 # Grid: (num_seqs, NUM_KV_HEADS, max_num_partitions)
+@triton.autotune(
+    configs=[
+        triton.Config({}, num_stages=1, num_warps=1),
+        triton.Config({}, num_stages=2, num_warps=1),
+        triton.Config({}, num_stages=3, num_warps=1),
+        triton.Config({}, num_stages=1, num_warps=2),
+        triton.Config({}, num_stages=2, num_warps=2),
+        triton.Config({}, num_stages=3, num_warps=2),
+        triton.Config({}, num_stages=1, num_warps=4),
+        triton.Config({}, num_stages=2, num_warps=4),
+        triton.Config({}, num_stages=3, num_warps=4),
+        triton.Config({}, num_stages=1, num_warps=8),
+        triton.Config({}, num_stages=2, num_warps=8),
+        triton.Config({}, num_stages=3, num_warps=8),
+    ],
+    key=[],
+)
 @triton.jit
 def _paged_attn_v2_kernel(
     m_i_ptr,
@@ -432,7 +451,7 @@ def paged_attention(
 
     max_num_partitions = triton.cdiv(max_context_len, v2_partition_size)
     grid = (num_seqs, num_kv_heads, max_num_partitions)
-    use_v1 = version == 1 or max_num_partitions == 1
+    use_v1 = version == 1
     if use_v1:
         _paged_attn_v1_kernel[grid](
             out,
@@ -587,7 +606,7 @@ if __name__ == '__main__':
     NUM_BLOCKS = 7000
     HEAD_SIZE = 128
     KV_BLOCK_SIZE = 16
-    MAX_SEQ_LEN = 512
+    MAX_SEQ_LEN = 4096
     CONTEXT_LENS = [random.randint(1, MAX_SEQ_LEN) for _ in range(NUM_SEQS)]
     MAX_NUM_BLOCKS_PER_SEQ = (max(CONTEXT_LENS) + KV_BLOCK_SIZE - 1) // KV_BLOCK_SIZE
 
