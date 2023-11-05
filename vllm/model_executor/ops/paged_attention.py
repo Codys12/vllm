@@ -40,7 +40,8 @@ def _paged_attn_mha_kernel(
         context_start_idx = partition_idx * PARTITION_SIZE
         if context_start_idx >= context_len:
             return
-        num_blocks = tl.cdiv(context_len - context_start_idx, KV_BLOCK_SIZE)
+        context_end_idx = tl.minimum(context_len, context_start_idx + PARTITION_SIZE)
+        num_blocks = tl.cdiv(context_end_idx - context_start_idx, KV_BLOCK_SIZE)
     else:
         context_start_idx = 0
         num_blocks = tl.cdiv(context_len, KV_BLOCK_SIZE)
@@ -446,12 +447,9 @@ def paged_attention(
 
     # TODO: Support ALiBi.
     assert not use_alibi
-    # TODO: Tune num_warps and num_stages.
-
-    max_num_partitions = triton.cdiv(max_context_len, v2_partition_size)
-    grid = (num_seqs, num_kv_heads, max_num_partitions)
     use_v1 = version == 1
     if use_v1:
+        grid = (num_seqs, num_kv_heads, 1)
         _paged_attn_v1_kernel[grid](
             out,
             query,
@@ -473,6 +471,8 @@ def paged_attention(
             kv_block_size,
         )
     else:
+        max_num_partitions = triton.cdiv(max_context_len, v2_partition_size)
+        grid = (num_seqs, num_kv_heads, max_num_partitions)
         m_i = torch.empty(
             size=(num_seqs, num_kv_heads, max_num_partitions, query_group_size),
             dtype=torch.float32,
