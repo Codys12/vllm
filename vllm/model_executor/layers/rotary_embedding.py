@@ -144,7 +144,12 @@ class RotaryEmbedding(nn.Module):
         query: torch.Tensor,
         key: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        return self._forward(positions, query, key)
+        # FIXME(woosuk): This is a hack.
+        is_prompt = query.shape[1] > 1
+        if is_prompt:
+            return self._forward_with_custom_op(positions, query, key)
+        else:
+            return self._forward(positions, query, key)
 
 
 class LinearScalingRotaryEmbedding(RotaryEmbedding):

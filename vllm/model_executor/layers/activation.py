@@ -35,7 +35,12 @@ class SiluAndMul(nn.Module):
         return out
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self._forward(x)
+        # FIXME(woosuk): This is a hack.
+        is_prompt = x.shape[1] > 1
+        if is_prompt:
+            return self._forward_with_custom_op(x)
+        else:
+            return self._forward(x)
 
 
 class NewGELU(nn.Module):

@@ -70,4 +70,9 @@ class RMSNorm(nn.Module):
         x: torch.Tensor,
         residual: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-        return self._forward(x, residual)
+        # FIXME(woosuk): This is a hack.
+        is_prompt = x.shape[1] > 1
+        if is_prompt:
+            return self._forward_with_custom_op(x, residual)
+        else:
+            return self._forward(x, residual)
