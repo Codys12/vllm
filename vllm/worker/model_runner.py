@@ -1,6 +1,7 @@
 import time
 from typing import Dict, List, Optional, Tuple
 
+import numpy as np
 import torch
 import torch.nn as nn
 
@@ -33,6 +34,8 @@ class ModelRunner:
         self.sliding_window = model_config.get_sliding_window()
         self.model = None
         self.block_size = None  # Set after initial profiling.
+        self.block_tables = np.empty((_BATCH_SIZES_TO_CAPTURE[-1], 256),
+                                     dtype=np.int32)
 
     def load_model(self) -> None:
         model = get_model(self.model_config)
@@ -170,6 +173,7 @@ class ModelRunner:
                 slot_mapping.append([])
                 context_lens.append(1)
                 block_tables.append([])
+            batch_size = padded_batch_size
 
         input_tokens = _make_tensor_with_pad(input_tokens,
                                              max_len=1,
@@ -187,18 +191,17 @@ class ModelRunner:
         context_lens = torch.tensor(context_lens,
                                     dtype=torch.int,
                                     device="cuda")
-        block_tables = _make_tensor_with_pad(
-            block_tables,
-            max_len=512,  # FIXME
-            pad=0,
-            dtype=torch.int)
+        input_block_tables = self.block_tables[:batch_size]
+        for i, block_table in enumerate(block_tables):
+            if block_table:
+                input_block_tables[i, :len(block_table)] = block_table
 
         input_metadata = InputMetadata(
             prompt_lens=[],
             slot_mapping=slot_mapping,
             max_context_len=max_context_len,
             context_lens=context_lens,
-            block_tables=block_tables,
+            block_tables=torch.from_numpy(input_block_tables).cuda(),
         )
         return input_tokens, input_positions, input_metadata
 
@@ -355,6 +358,7 @@ class ModelRunner:
         self.compiled_model = torch.compile(self.model,
                                             mode="reduce-overhead",
                                             fullgraph=True)
+        self.block_tables.fill(0)
         for batch_size in _BATCH_SIZES_TO_CAPTURE:
             # Create dummy inputs.
             input_tokens = _make_tensor_with_pad([[]] * batch_size,
@@ -372,17 +376,13 @@ class ModelRunner:
             context_lens = torch.tensor([1] * batch_size,
                                         dtype=torch.int,
                                         device="cuda")
-            block_tables = _make_tensor_with_pad(
-                [[]] * batch_size,
-                max_len=512,  # FIXME
-                pad=0,
-                dtype=torch.int)
+            input_block_tables = self.block_tables[:batch_size]
             input_metadata = InputMetadata(
                 prompt_lens=[],
                 slot_mapping=slot_mapping,
                 max_context_len=8192,  # FIXME
                 context_lens=context_lens,
-                block_tables=block_tables,
+                block_tables=torch.from_numpy(input_block_tables).cuda(),
             )
 
             # Run the model once before compilation.
