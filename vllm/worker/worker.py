@@ -45,7 +45,6 @@ class Worker:
         self.cache_config = None
         self.cache_engine = None
         self.cache_events = None
-        self.gpu_cache = None
 
     def init_model(self):
         # This env var set by Ray causes exceptions with graph building.
@@ -112,12 +111,11 @@ class Worker:
         self.cache_engine = CacheEngine(self.cache_config, self.model_config,
                                         self.parallel_config)
         self.cache_events = self.cache_engine.events
-        self.gpu_cache = self.cache_engine.gpu_cache
-        self.model_runner.set_block_size(self.cache_engine.block_size)
+        self.model_runner.set_kv_caches(self.cache_engine.gpu_cache, self.cache_config.block_size)
 
     def warm_up_model(self) -> None:
         if not self.model_config.enforce_eager:
-            self.model_runner.capture_model(self.gpu_cache)
+            self.model_runner.compile_model()
 
     @torch.inference_mode()
     def execute_model(
@@ -150,8 +148,7 @@ class Worker:
         if not seq_group_metadata_list:
             return {}
 
-        output = self.model_runner.execute_model(seq_group_metadata_list,
-                                                 self.gpu_cache)
+        output = self.model_runner.execute_model(seq_group_metadata_list)
         return output
 
 
