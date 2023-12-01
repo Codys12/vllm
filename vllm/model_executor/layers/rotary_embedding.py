@@ -26,8 +26,22 @@ from typing import Any, Dict, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from vllm._C import ops
+
+
+def _rotate_neox(x: torch.Tensor) -> torch.Tensor:
+    x1 = x[..., :x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2:]
+    return torch.cat((-x2, x1), dim=-1)
+
+
+def _rotate_gptj(x: torch.Tensor) -> torch.Tensor:
+    x1 = x[..., ::2]
+    x2 = x[..., 1::2]
+    x = torch.stack((-x2, x1), dim=-1)
+    return x.flatten(-2)
 
 
 class RotaryEmbedding(nn.Module):
@@ -81,7 +95,38 @@ class RotaryEmbedding(nn.Module):
         cache = torch.cat((cos, sin), dim=-1)
         return cache
 
-    def forward(
+    def _forward(
+        self,
+        positions: torch.Tensor,
+        query: torch.Tensor,
+        key: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        query = query.view(*query.shape[:-1], -1, self.head_size)
+        key = key.view(*key.shape[:-1], -1, self.head_size)
+
+        query_rot = query[..., :self.rotary_dim]
+        qeury_pass = query[..., self.rotary_dim:]
+        key_rot = key[..., :self.rotary_dim]
+        key_pass = key[..., self.rotary_dim:]
+
+        cos_sin = F.embedding(positions, self.cos_sin_cache)
+        cos, sin = cos_sin.chunk(2, dim=-1)
+        if self.is_neox_style:
+            cos = cos.repeat(1, 1, 2).unsqueeze(-2)
+            sin = sin.repeat(1, 1, 2).unsqueeze(-2)
+        else:
+            cos = cos.repeat_interleave(2, dim=-1).unsqueeze(-2)
+            sin = sin.repeat_interleave(2, dim=-1).unsqueeze(-2)
+
+        rotate_fn = _rotate_neox if self.is_neox_style else _rotate_gptj
+        query_rot = query_rot * cos + rotate_fn(query_rot) * sin
+        key_rot = key_rot * cos + rotate_fn(key_rot) * sin
+
+        query = torch.cat((query_rot, qeury_pass), dim=-1).flatten(-2)
+        key = torch.cat((key_rot, key_pass), dim=-1).flatten(-2)
+        return query, key
+
+    def _forward_with_custom_op(
         self,
         positions: torch.Tensor,
         query: torch.Tensor,
@@ -92,6 +137,14 @@ class RotaryEmbedding(nn.Module):
         ops.rotary_embedding(positions, query, key, self.head_size,
                              self.cos_sin_cache, self.is_neox_style)
         return query, key
+
+    def forward(
+        self,
+        positions: torch.Tensor,
+        query: torch.Tensor,
+        key: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        return self._forward(positions, query, key)
 
 
 class LinearScalingRotaryEmbedding(RotaryEmbedding):
