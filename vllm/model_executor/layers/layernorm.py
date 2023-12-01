@@ -23,7 +23,27 @@ class RMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(hidden_size))
         self.variance_epsilon = eps
 
-    def forward(
+    def _forward(
+        self,
+        x: torch.Tensor,
+        residual: Optional[torch.Tensor] = None,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        if residual is not None:
+            x = x + residual
+            residual = x
+        orig_dtype = x.dtype
+        x = x.float()
+
+        mean = torch.mean(x * x, dim=-1, keepdim=True)
+        output = x * torch.rsqrt(mean + self.variance_epsilon)
+        output = output.to(orig_dtype)
+        output = output * self.weight
+        if residual is None:
+            return output
+        else:
+            return output, residual
+
+    def _forward_with_custom_op(
         self,
         x: torch.Tensor,
         residual: Optional[torch.Tensor] = None,
@@ -44,3 +64,10 @@ class RMSNorm(nn.Module):
             self.variance_epsilon,
         )
         return out
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        residual: Optional[torch.Tensor] = None,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        return self._forward(x, residual)
