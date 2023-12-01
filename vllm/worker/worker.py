@@ -111,7 +111,8 @@ class Worker:
         self.cache_engine = CacheEngine(self.cache_config, self.model_config,
                                         self.parallel_config)
         self.cache_events = self.cache_engine.events
-        self.model_runner.set_kv_caches(self.cache_engine.gpu_cache, self.cache_config.block_size)
+        self.model_runner.set_kv_caches(self.cache_engine.gpu_cache,
+                                        self.cache_config.block_size)
 
     def warm_up_model(self) -> None:
         if not self.model_config.enforce_eager:
