@@ -15,8 +15,8 @@ logger = init_logger(__name__)
 
 KVCache = Tuple[torch.Tensor, torch.Tensor]
 _PAD_SLOT_ID = -1
-# Capture graphs for batch size 1, 2, 4, 8, 16, 24, 32, 40, ..., 256.
-_BATCH_SIZES_TO_CAPTURE = [1, 2, 4] + [8 * i for i in range(1, 33)]
+# Compile graphs for batch size 1, 2, 4, 8, 16, 24, 32, 40, ..., 256.
+_BATCH_SIZES_TO_COMPILE = [1, 2, 4] + [8 * i for i in range(1, 33)]
 
 
 class ModelRunner:
@@ -34,7 +34,7 @@ class ModelRunner:
         self.sliding_window = model_config.get_sliding_window()
         self.model = None
         self.block_size = None  # Set after initial profiling.
-        self.block_tables = np.empty((_BATCH_SIZES_TO_CAPTURE[-1], 256),
+        self.block_tables = np.empty((_BATCH_SIZES_TO_COMPILE[-1], 256),
                                      dtype=np.int32)
 
     def load_model(self) -> None:
@@ -359,7 +359,7 @@ class ModelRunner:
                                             mode="reduce-overhead",
                                             fullgraph=True)
         self.block_tables.fill(0)
-        for batch_size in _BATCH_SIZES_TO_CAPTURE:
+        for batch_size in reversed(_BATCH_SIZES_TO_COMPILE):
             # Create dummy inputs.
             input_tokens = _make_tensor_with_pad([[]] * batch_size,
                                                  max_len=1,
@@ -450,7 +450,7 @@ def _make_tensor_with_pad(
 
 def _get_padded_batch_size(batch_size: int) -> Optional[int]:
     # Do we need to optimize this?
-    for bucket in _BATCH_SIZES_TO_CAPTURE:
+    for bucket in _BATCH_SIZES_TO_COMPILE:
         if batch_size <= bucket:
             return bucket
     return None
