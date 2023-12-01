@@ -32,13 +32,16 @@ class ModelRunner:
 
         self.sliding_window = model_config.get_sliding_window()
         self.model = None
-        self.graph_runners: Dict[int, CUDAGraphRunner] = {}
         self.block_size = None  # Set after initial profiling.
 
     def load_model(self) -> None:
-        self.model = get_model(self.model_config)
+        model = get_model(self.model_config)
+        num_layers = self.model_config.get_num_layers(self.parallel_config)
+        kv_caches = [(None, None)] * num_layers
+        self.model = ModelWrapper(model, kv_caches)
 
-    def set_block_size(self, block_size: int) -> None:
+    def set_kv_caches(self, kv_caches: List[KVCache], block_size: int) -> None:
+        self.model.kv_caches = kv_caches
         self.block_size = block_size
 
     def _prepare_prompt(
@@ -273,7 +276,6 @@ class ModelRunner:
     def execute_model(
         self,
         seq_group_metadata_list: List[SequenceGroupMetadata],
-        kv_caches: List[Tuple[torch.Tensor, torch.Tensor]],
     ) -> SamplerOutput:
         # NOTE: We assume that all sequences in the group are all prompts or
         # all decodes.
@@ -302,7 +304,6 @@ class ModelRunner:
         hidden_states = model_executable(
             input_ids=input_tokens,
             positions=input_positions,
-            kv_caches=kv_caches,
             input_metadata=input_metadata,
         )
         if batch_size != padded_batch_size:
@@ -340,20 +341,21 @@ class ModelRunner:
             seqs.append(seq)
 
         # Run the model with the dummy inputs.
-        num_layers = self.model_config.get_num_layers(self.parallel_config)
-        kv_caches = [(None, None)] * num_layers
-        self.execute_model(seqs, kv_caches)
+        self.execute_model(seqs)
         return
 
     @torch.inference_mode()
-    def capture_model(self, kv_caches: List[KVCache]) -> None:
+    def compile_model(self) -> None:
         assert not self.model_config.enforce_eager
-        logger.info("Capturing the model using CUDA graph. This may lead to "
-                    "unexpected consequences if the model is not static. To "
-                    "run the model in eager mode, set 'enforce_eager=True' or "
-                    "use '--enforce-eager' in the CLI.")
+        logger.info("Compiling the model using torch.compile, which may take "
+                    "several minutes. If you prefer to skip the compilation, "
+                    "albeit with performance degradation, set "
+                    "'enforce_eager=True' or use '--enforce-eager' in CLI.")
 
         start_time = time.perf_counter()
+        self.compiled_model = torch.compile(self.model,
+                                            mode="reduce-overhead",
+                                            fullgraph=True)
         # NOTE: Capturing the largest batch size first may help reduce the
         # memory usage of CUDA graph.
         for batch_size in reversed(_BATCH_SIZES_TO_CAPTURE):
@@ -368,7 +370,7 @@ class ModelRunner:
                                                     dtype=torch.long)
             slot_mapping = _make_tensor_with_pad([[]] * batch_size,
                                                  max_len=1,
-                                                 pad=_PAD_SLOT_ID,
+                                                 pad=-1,
                                                  dtype=torch.long)
             context_lens = torch.tensor([1] * batch_size,
                                         dtype=torch.int,
@@ -381,99 +383,57 @@ class ModelRunner:
             input_metadata = InputMetadata(
                 prompt_lens=[],
                 slot_mapping=slot_mapping,
-                max_context_len=8192, # FIXME
+                max_context_len=8192,  # FIXME
                 context_lens=context_lens,
                 block_tables=block_tables,
             )
 
-            graph_runner = CUDAGraphRunner(self.model)
-            graph_runner.capture(
+            # Run the model once before compilation.
+            self.model(
                 input_tokens,
                 input_positions,
-                kv_caches,
                 input_metadata,
             )
-            self.graph_runners[batch_size] = graph_runner
+            # Compile the model with the dummy inputs.
+            self.compiled_model(
+                input_tokens,
+                input_positions,
+                input_metadata,
+            )
 
         end_time = time.perf_counter()
-        elapsed_time = end_time - start_time
-        # This usually takes < 10 seconds.
-        logger.info(f"Graph capturing finished in {elapsed_time:.0f} secs.")
+        compile_time = end_time - start_time
+        # This usually takes 2-5 mins.
+        logger.info(f"Model compilation finished in {compile_time:.0f} secs.")
 
 
-class CUDAGraphRunner:
+class ModelWrapper(nn.Module):
 
-    def __init__(self, model: nn.Module):
-        self.model = model
-        self.graph = None
-        self.input_buffers: Dict[str, torch.Tensor] = {}
-        self.output_buffers: Dict[str, torch.Tensor] = {}
-
-    def capture(
+    def __init__(
         self,
-        input_ids: torch.Tensor,
-        positions: torch.Tensor,
-        kv_caches: List[KVCache],
-        input_metadata: InputMetadata,
-    ) -> None:
-        assert self.graph is None
-        # Run the model once without capturing the graph.
-        # This is to make sure that the captured graph does not include the
-        # kernel launches for initial benchmarking (e.g., Triton autotune).
-        self.model(
-            input_ids,
-            positions,
-            kv_caches,
-            input_metadata,
-        )
-
-        # Capture the graph.
-        self.graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(self.graph):
-            hidden_states = self.model(
-                input_ids,
-                positions,
-                kv_caches,
-                input_metadata,
-            )
-
-        # Save the input and output buffers.
-        self.input_buffers = {
-            "input_ids": input_ids,
-            "positions": positions,
-            "kv_caches": kv_caches,
-            "slot_mapping": input_metadata.slot_mapping,
-            "context_lens": input_metadata.context_lens,
-            "block_tables": input_metadata.block_tables,
-        }
-        self.output_buffers = {"hidden_states": hidden_states}
-        return
+        model: nn.Module,
+        kv_caches: List[Tuple[torch.Tensor, torch.Tensor]],
+    ):
+        super().__init__()
+        self.model = model
+        self.kv_caches = kv_caches
 
     def forward(
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-        kv_caches: List[Tuple[torch.Tensor, torch.Tensor]],
         input_metadata: InputMetadata,
     ) -> torch.Tensor:
-        # KV caches are fixed tensors, so we don't need to copy them.
-        assert kv_caches == self.input_buffers["kv_caches"]
+        hidden_states = self.model(
+            input_ids,
+            positions,
+            self.kv_caches,
+            input_metadata,
+        )
+        return hidden_states
 
-        # Copy the input tensors to the input buffers.
-        self.input_buffers["input_ids"].copy_(input_ids)
-        self.input_buffers["positions"].copy_(positions)
-        self.input_buffers["slot_mapping"].copy_(input_metadata.slot_mapping)
-        self.input_buffers["context_lens"].copy_(input_metadata.context_lens)
-        self.input_buffers["block_tables"].copy_(input_metadata.block_tables)
-
-        # Run the graph.
-        self.graph.replay()
-
-        # Return the output tensor.
-        return self.output_buffers["hidden_states"]
-
-    def __call__(self, *args, **kwargs):
-        return self.forward(*args, **kwargs)
+    def sample(self, *args, **kwargs) -> SamplerOutput:
+        return self.model.sample(*args, **kwargs)
 
 
 def _pad_to_max(x: List[int], max_len: int, pad: int) -> List[int]:
