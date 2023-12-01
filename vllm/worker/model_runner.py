@@ -298,9 +298,8 @@ class ModelRunner:
                                                  input_metadata.prompt_lens)
 
         # Execute the model.
-        use_captured_graph = padded_batch_size is not None
-        model_executable = (self.graph_runners[padded_batch_size]
-                            if use_captured_graph else self.model)
+        use_compiled = padded_batch_size is not None
+        model_executable = self.compiled_model if use_compiled else self.model
         hidden_states = model_executable(
             input_ids=input_tokens,
             positions=input_positions,
@@ -356,9 +355,7 @@ class ModelRunner:
         self.compiled_model = torch.compile(self.model,
                                             mode="reduce-overhead",
                                             fullgraph=True)
-        # NOTE: Capturing the largest batch size first may help reduce the
-        # memory usage of CUDA graph.
-        for batch_size in reversed(_BATCH_SIZES_TO_CAPTURE):
+        for batch_size in _BATCH_SIZES_TO_CAPTURE:
             # Create dummy inputs.
             input_tokens = _make_tensor_with_pad([[]] * batch_size,
                                                  max_len=1,
