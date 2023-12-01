@@ -1,8 +1,9 @@
 """Multi-head attention."""
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import torch
 import torch.nn as nn
+import torch._custom_ops as torch_custom_ops
 from xformers import ops as xops
 from xformers.ops.fmha.attn_bias import (BlockDiagonalCausalMask,
                                          LowerTriangularMaskWithTensorBias)
@@ -14,6 +15,122 @@ from vllm.model_executor.input_metadata import InputMetadata
 _SUPPORTED_HEAD_SIZES = [64, 80, 96, 112, 128, 256]
 # Should be the same as PARTITION_SIZE in `paged_attention_v2_launcher`.
 _PARTITION_SIZE = 512
+
+
+@torch_custom_ops.custom_op("vllm::cache_kv")
+def cache_kv(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    raise NotImplementedError()
+
+
+@torch_custom_ops.impl("vllm::cache_kv", device_types="cuda")
+def cache_kv_impl(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    # NOTE: query is actually not used in the custom op. We pass it to create
+    # a fake dependency so that the compiler cannot skip the custom op.
+    # FIXME: The custom op should not be in-place.
+    key_clone = key.clone()
+    cache_ops.reshape_and_cache(
+        key_clone,
+        value,
+        key_cache,
+        value_cache,
+        slot_mapping,
+    )
+    return query.clone(), key_clone
+
+
+@torch_custom_ops.impl_abstract("vllm::cache_kv")
+def cache_kv_abstract(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    out_query = torch.empty_strided(
+        query.shape,
+        query.stride(),
+        dtype=query.dtype,
+        device=query.device,
+    )
+    out_key = torch.empty_strided(
+        key.shape,
+        key.stride(),
+        dtype=key.dtype,
+        device=key.device,
+    )
+    return out_query, out_key
+
+
+@torch_custom_ops.custom_op("vllm::paged_attn")
+def paged_attn(
+    query: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    head_mapping: torch.Tensor,
+    scale: float,
+    block_tables: torch.Tensor,
+    context_lens: torch.Tensor,
+    alibi_slopes: Optional[torch.Tensor],
+) -> torch.Tensor:
+    raise NotImplementedError()
+
+
+@torch_custom_ops.impl("vllm::paged_attn", device_types="cuda")
+def paged_attn_impl(
+    query: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    head_mapping: torch.Tensor,
+    scale: float,
+    block_tables: torch.Tensor,
+    context_lens: torch.Tensor,
+    alibi_slopes: Optional[torch.Tensor],
+) -> torch.Tensor:
+    output = torch.empty_like(query)
+    block_size = value_cache.shape[3]
+    ops.paged_attention_v1(
+        output,
+        query,
+        key_cache,
+        value_cache,
+        head_mapping,
+        scale,
+        block_tables,
+        context_lens,
+        block_size,
+        8192,  # FIXME
+        alibi_slopes,
+    )
+    return output
+
+
+@torch_custom_ops.impl_abstract("vllm::paged_attn")
+def paged_attn_abstract(
+    query: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    head_mapping: torch.Tensor,
+    scale: float,
+    block_tables: torch.Tensor,
+    context_lens: torch.Tensor,
+    alibi_slopes: Optional[torch.Tensor],
+) -> torch.Tensor:
+    return torch.empty_like(query)
 
 
 class PagedAttention(nn.Module):
@@ -92,8 +209,18 @@ class PagedAttention(nn.Module):
         # If key_cache and value_cache are not provided, the new key and value
         # vectors will not be cached. This happens during the initial memory
         # profiling run.
-        if key_cache is not None and value_cache is not None:
-            cache_ops.reshape_and_cache(
+        if input_metadata.is_prompt:
+            if key_cache is not None and value_cache is not None:
+                cache_ops.reshape_and_cache(
+                    key,
+                    value,
+                    key_cache,
+                    value_cache,
+                    slot_mapping,
+                )
+        else:
+            query, key = torch.ops.vllm.cache_kv(
+                query,
                 key,
                 value,
                 key_cache,
@@ -156,13 +283,14 @@ class PagedAttention(nn.Module):
             output = out.view_as(query)
         else:
             # Decoding run.
-            output = _paged_attention(
+            output = torch.ops.vllm.paged_attn(
                 query,
                 key_cache,
                 value_cache,
-                input_metadata,
                 self.head_mapping,
                 self.scale,
+                input_metadata.block_tables,
+                input_metadata.context_lens,
                 self.alibi_slopes,
             )
 
