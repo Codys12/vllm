@@ -27,8 +27,50 @@ from typing import Any, Dict, Optional, Tuple, Union
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch._custom_ops as torch_custom_ops
 
 from vllm._C import ops
+
+
+@torch_custom_ops.custom_op("vllm::rope")
+def rope(
+    positions: torch.Tensor,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    head_size: int,
+    cos_sin_cache: torch.Tensor,
+    is_neox_style: bool,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    raise NotImplementedError()
+
+
+@torch_custom_ops.impl("vllm::rope", device_types="cuda")
+def rope_impl(
+    positions: torch.Tensor,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    head_size: int,
+    cos_sin_cache: torch.Tensor,
+    is_neox_style: bool,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    # FIXME: The custom op should not be in-place.
+    query = query.clone()
+    key = key.clone()
+    ops.rotary_embedding(positions, query, key, head_size, cos_sin_cache,
+                         is_neox_style)
+    return query, key
+
+
+@torch_custom_ops.impl_abstract("vllm::rope")
+def rope_abstract(
+    positions: torch.Tensor,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    head_size: int,
+    cos_sin_cache: torch.Tensor,
+    is_neox_style: bool,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    return torch.empty_like(query), torch.empty_like(key)
 
 
 def _rotate_neox(x: torch.Tensor) -> torch.Tensor:
@@ -149,7 +191,11 @@ class RotaryEmbedding(nn.Module):
         if is_prompt:
             return self._forward_with_custom_op(positions, query, key)
         else:
-            return self._forward(positions, query, key)
+            query, key = torch.ops.vllm.rope(positions, query, key,
+                                             self.head_size,
+                                             self.cos_sin_cache,
+                                             self.is_neox_style)
+            return query, key
 
 
 class LinearScalingRotaryEmbedding(RotaryEmbedding):
