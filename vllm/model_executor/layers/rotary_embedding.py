@@ -26,7 +26,6 @@ from typing import Any, Dict, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import torch._custom_ops as torch_custom_ops
 
 from vllm._C import ops
