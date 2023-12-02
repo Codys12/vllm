@@ -13,6 +13,11 @@ from vllm.model_executor.parallel_utils.utils import divide
 from vllm.model_executor.utils import set_weight_attrs
 
 
+def _silu_and_mul(x: torch.Tensor) -> torch.Tensor:
+    d = x.shape[-1] // 2
+    return F.silu(x[..., :d]) * x[..., d:]
+
+
 class SiluAndMul(nn.Module):
     """An activation function for SwiGLU.
 
@@ -24,8 +29,7 @@ class SiluAndMul(nn.Module):
     """
 
     def _forward(self, x: torch.Tensor) -> torch.Tensor:
-        d = x.shape[-1] // 2
-        return F.silu(x[..., :d]) * x[..., d:]
+        return _silu_and_mul(x)
 
     def _forward_with_custom_op(self, x: torch.Tensor) -> torch.Tensor:
         d = x.shape[-1] // 2
