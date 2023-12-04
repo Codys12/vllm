@@ -123,6 +123,7 @@ class ModelRunner:
             max_context_len=None,
             context_lens=None,
             block_tables=None,
+            do_compile=False,
         )
         return input_tokens, input_positions, input_metadata
 
@@ -205,6 +206,7 @@ class ModelRunner:
             max_context_len=max_context_len,
             context_lens=context_lens,
             block_tables=torch.from_numpy(input_block_tables).cuda(),
+            do_compile=padded_batch_size is not None,
         )
         return input_tokens, input_positions, input_metadata
 
@@ -386,6 +388,7 @@ class ModelRunner:
                 max_context_len=8192,  # FIXME
                 context_lens=context_lens,
                 block_tables=torch.from_numpy(input_block_tables).cuda(),
+                do_compile=True,
             )
 
             # Run the model once before compilation.
