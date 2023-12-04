@@ -209,7 +209,7 @@ class PagedAttention(nn.Module):
         # If key_cache and value_cache are not provided, the new key and value
         # vectors will not be cached. This happens during the initial memory
         # profiling run.
-        if input_metadata.is_prompt:
+        if input_metadata.is_prompt or not input_metadata.do_compile:
             if key_cache is not None and value_cache is not None:
                 cache_ops.reshape_and_cache(
                     key,
@@ -230,6 +230,7 @@ class PagedAttention(nn.Module):
 
         if input_metadata.is_prompt:
             # Prompt run.
+            assert not input_metadata.do_compile
             if self.num_kv_heads != self.num_heads:
                 # As of Nov 2023, xformers only supports MHA. For MQA/GQA,
                 # project the key and value tensors to the desired number of
@@ -283,16 +284,27 @@ class PagedAttention(nn.Module):
             output = out.view_as(query)
         else:
             # Decoding run.
-            output = torch.ops.vllm.paged_attn(
-                query,
-                key_cache,
-                value_cache,
-                self.head_mapping,
-                self.scale,
-                input_metadata.block_tables,
-                input_metadata.context_lens,
-                self.alibi_slopes,
-            )
+            if input_metadata.do_compile:
+                output = torch.ops.vllm.paged_attn(
+                    query,
+                    key_cache,
+                    value_cache,
+                    self.head_mapping,
+                    self.scale,
+                    input_metadata.block_tables,
+                    input_metadata.context_lens,
+                    self.alibi_slopes,
+                )
+            else:
+                output = _paged_attention(
+                    query,
+                    key_cache,
+                    value_cache,
+                    input_metadata,
+                    self.head_mapping,
+                    self.scale,
+                    self.alibi_slopes,
+                )
 
         # Reshape the output tensor.
         return output.view(batch_size, seq_len, hidden_size)
