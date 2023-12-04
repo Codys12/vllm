@@ -5,6 +5,7 @@ from typing import Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch._custom_ops as torch_custom_ops
 
 from vllm._C import ops
 from vllm.model_executor.layers.quantization import QuantizationConfig
@@ -12,6 +13,28 @@ from vllm.model_executor.parallel_utils.parallel_state import (
     get_tensor_model_parallel_rank, get_tensor_model_parallel_world_size)
 from vllm.model_executor.parallel_utils.utils import divide
 from vllm.model_executor.utils import set_weight_attrs
+
+
+@torch_custom_ops.custom_op("vllm::silu_and_mul")
+def silu_and_mul(x: torch.Tensor) -> torch.Tensor:
+    raise NotImplementedError()
+
+
+@torch_custom_ops.impl("vllm::silu_and_mul", device_types="cuda")
+def silu_and_mul_impl(x: torch.Tensor) -> torch.Tensor:
+    d = x.shape[-1] // 2
+    output_shape = (x.shape[:-1] + (d, ))
+    out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
+    ops.silu_and_mul(out, x)
+    return out
+
+
+@torch_custom_ops.impl_abstract("vllm::silu_and_mul")
+def silu_and_mul_abstract(x: torch.Tensor) -> torch.Tensor:
+    d = x.shape[-1] // 2
+    output_shape = (x.shape[:-1] + (d, ))
+    out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
+    return out
 
 
 class SiluAndMul(nn.Module):
@@ -29,7 +52,12 @@ class SiluAndMul(nn.Module):
         d = x.shape[-1] // 2
         return F.silu(x[..., :d]) * x[..., d:]
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self,
+                x: torch.Tensor,
+                do_compile: bool = False) -> torch.Tensor:
+        if do_compile:
+            return torch.ops.vllm.silu_and_mul(x)
+
         d = x.shape[-1] // 2
         output_shape = (x.shape[:-1] + (d, ))
         out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
