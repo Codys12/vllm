@@ -177,3 +177,6 @@ _build/
 # vim swap files
 *.swo
 *.swp
+
+# torch compile
+torch_compile_debug/
