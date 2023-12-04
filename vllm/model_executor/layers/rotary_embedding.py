@@ -85,48 +85,6 @@ def _rotate_gptj(x: torch.Tensor) -> torch.Tensor:
     return x.flatten(-2)
 
 
-def _rope(
-    positions: torch.Tensor,
-    query: torch.Tensor,
-    key: torch.Tensor,
-    cos_sin_cache: torch.Tensor,
-    head_size: int,
-    rotary_dim: int,
-    is_neox_style: bool,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    query = query.view(*query.shape[:-1], -1, head_size)
-    key = key.view(*key.shape[:-1], -1, head_size)
-
-    query_rot = query[..., :rotary_dim]
-    key_rot = key[..., :rotary_dim]
-    if rotary_dim < head_size:
-        query_pass = query[..., rotary_dim:]
-        key_pass = key[..., rotary_dim:]
-
-    cos_sin = cos_sin_cache[positions]
-    cos, sin = cos_sin.chunk(2, dim=-1)
-    if is_neox_style:
-        cos = cos.repeat(1, 1, 2).unsqueeze(-2)
-        sin = sin.repeat(1, 1, 2).unsqueeze(-2)
-    else:
-        cos = cos.repeat_interleave(2, dim=-1).unsqueeze(-2)
-        sin = sin.repeat_interleave(2, dim=-1).unsqueeze(-2)
-
-    rotate_fn = _rotate_neox if is_neox_style else _rotate_gptj
-    query_rot = query_rot * cos + rotate_fn(query_rot) * sin
-    key_rot = key_rot * cos + rotate_fn(key_rot) * sin
-
-    if rotary_dim < head_size:
-        query = torch.cat((query_rot, query_pass), dim=-1)
-        key = torch.cat((key_rot, key_pass), dim=-1)
-    else:
-        query = query_rot
-        key = key_rot
-    query = query.flatten(-2)
-    key = key.flatten(-2)
-    return query, key
-
-
 class RotaryEmbedding(nn.Module):
     """Original rotary positional embedding."""
 
@@ -184,10 +142,42 @@ class RotaryEmbedding(nn.Module):
         query: torch.Tensor,
         key: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        return _rope(positions, query, key, self.cos_sin_cache, self.head_size,
-                     self.rotary_dim, self.is_neox_style)
+        """PyTorch-native implementation equivalent to forward()."""
+        query = query.view(*query.shape[:-1], -1, self.head_size)
+        key = key.view(*key.shape[:-1], -1, self.head_size)
 
-    def _forward_with_custom_op(
+        query_rot = query[..., :self.rotary_dim]
+        key_rot = key[..., :self.rotary_dim]
+        if self.rotary_dim < self.head_size:
+            query_pass = query[..., self.rotary_dim:]
+            key_pass = key[..., self.rotary_dim:]
+
+        cos_sin = self.cos_sin_cache[positions]
+        cos, sin = cos_sin.chunk(2, dim=-1)
+        if self.is_neox_style:
+            # NOTE(woosuk): Here we assume that the positions tensor has the
+            # shape [batch_size, seq_len].
+            cos = cos.repeat(1, 1, 2).unsqueeze(-2)
+            sin = sin.repeat(1, 1, 2).unsqueeze(-2)
+        else:
+            cos = cos.repeat_interleave(2, dim=-1).unsqueeze(-2)
+            sin = sin.repeat_interleave(2, dim=-1).unsqueeze(-2)
+
+        rotate_fn = _rotate_neox if self.is_neox_style else _rotate_gptj
+        query_rot = query_rot * cos + rotate_fn(query_rot) * sin
+        key_rot = key_rot * cos + rotate_fn(key_rot) * sin
+
+        if self.rotary_dim < self.head_size:
+            query = torch.cat((query_rot, query_pass), dim=-1)
+            key = torch.cat((key_rot, key_pass), dim=-1)
+        else:
+            query = query_rot
+            key = key_rot
+        query = query.flatten(-2)
+        key = key.flatten(-2)
+        return query, key
+
+    def forward(
         self,
         positions: torch.Tensor,
         query: torch.Tensor,
@@ -198,23 +188,6 @@ class RotaryEmbedding(nn.Module):
         ops.rotary_embedding(positions, query, key, self.head_size,
                              self.cos_sin_cache, self.is_neox_style)
         return query, key
-
-    def forward(
-        self,
-        positions: torch.Tensor,
-        query: torch.Tensor,
-        key: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        # FIXME(woosuk): This is a hack.
-        is_prompt = query.shape[1] > 1
-        if is_prompt:
-            return self._forward_with_custom_op(positions, query, key)
-        else:
-            query, key = torch.ops.vllm.rope(positions, query, key,
-                                             self.head_size,
-                                             self.cos_sin_cache,
-                                             self.is_neox_style)
-            return query, key
 
 
 class LinearScalingRotaryEmbedding(RotaryEmbedding):

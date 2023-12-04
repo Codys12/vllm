@@ -7,28 +7,6 @@ import torch.nn as nn
 from vllm._C import ops
 
 
-def _rms_norm(
-    x: torch.Tensor,
-    residual: Optional[torch.Tensor],
-    weight: torch.Tensor,
-    eps: float,
-) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-    if residual is not None:
-        x = x + residual
-        residual = x
-    orig_dtype = x.dtype
-    x = x.float()
-
-    mean = torch.mean(x * x, dim=-1, keepdim=True)
-    output = x * torch.rsqrt(mean + eps)
-    output = output.to(orig_dtype)
-    output = output * weight
-    if residual is None:
-        return output
-    else:
-        return output, residual
-
-
 class RMSNorm(nn.Module):
     """Root mean square normalization.
 
@@ -50,9 +28,22 @@ class RMSNorm(nn.Module):
         x: torch.Tensor,
         residual: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-        return _rms_norm(x, residual, self.weight.data, self.variance_epsilon)
+        """PyTorch-native implementation equivalent to forward()."""
+        orig_dtype = x.dtype
+        x = x.to(torch.float32)
+        if residual is not None:
+            x = x + residual.to(torch.float32)
+            residual = x.to(orig_dtype)
 
-    def _forward_with_custom_op(
+        variance = x.pow(2).mean(dim=-1, keepdim=True)
+        x = x * torch.rsqrt(variance + self.variance_epsilon)
+        x = x.to(orig_dtype) * self.weight
+        if residual is None:
+            return x
+        else:
+            return x, residual
+
+    def forward(
         self,
         x: torch.Tensor,
         residual: Optional[torch.Tensor] = None,
@@ -73,15 +64,3 @@ class RMSNorm(nn.Module):
             self.variance_epsilon,
         )
         return out
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        residual: Optional[torch.Tensor] = None,
-    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-        # FIXME(woosuk): This is a hack.
-        is_prompt = x.shape[1] > 1
-        if is_prompt:
-            return self._forward_with_custom_op(x, residual)
-        else:
-            return self._forward(x, residual)

@@ -1,4 +1,5 @@
 """Custom activation functions."""
+import math
 from typing import Optional
 
 import torch
@@ -13,11 +14,6 @@ from vllm.model_executor.parallel_utils.utils import divide
 from vllm.model_executor.utils import set_weight_attrs
 
 
-def _silu_and_mul(x: torch.Tensor) -> torch.Tensor:
-    d = x.shape[-1] // 2
-    return F.silu(x[..., :d]) * x[..., d:]
-
-
 class SiluAndMul(nn.Module):
     """An activation function for SwiGLU.
 
@@ -29,25 +25,25 @@ class SiluAndMul(nn.Module):
     """
 
     def _forward(self, x: torch.Tensor) -> torch.Tensor:
-        return _silu_and_mul(x)
+        """PyTorch-native implementation equivalent to forward()."""
+        d = x.shape[-1] // 2
+        return F.silu(x[..., :d]) * x[..., d:]
 
-    def _forward_with_custom_op(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         d = x.shape[-1] // 2
         output_shape = (x.shape[:-1] + (d, ))
         out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
         ops.silu_and_mul(out, x)
         return out
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # FIXME(woosuk): This is a hack.
-        is_prompt = x.shape[1] > 1
-        if is_prompt:
-            return self._forward_with_custom_op(x)
-        else:
-            return self._forward(x)
-
 
 class NewGELU(nn.Module):
+
+    def _forward(self, x: torch.Tensor) -> torch.Tensor:
+        """PyTorch-native implementation equivalent to forward()."""
+        c = math.sqrt(2.0 / math.pi)
+        return 0.5 * x * (1.0 + torch.tanh(c *
+                                           (x + 0.044715 * torch.pow(x, 3.0))))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         out = torch.empty_like(x)
@@ -56,6 +52,11 @@ class NewGELU(nn.Module):
 
 
 class FastGELU(nn.Module):
+
+    def _forward(self, x: torch.Tensor) -> torch.Tensor:
+        """PyTorch-native implementation equivalent to forward()."""
+        return 0.5 * x * (1.0 + torch.tanh(x * 0.7978845608 *
+                                           (1.0 + 0.044715 * x * x)))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         out = torch.empty_like(x)
