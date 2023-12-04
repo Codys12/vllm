@@ -21,12 +21,14 @@ class InputMetadata:
         max_context_len: Optional[int],
         context_lens: Optional[torch.Tensor],
         block_tables: Optional[torch.Tensor],
+        do_compile: bool,
     ) -> None:
         self.prompt_lens = prompt_lens
         self.max_context_len = max_context_len
         self.slot_mapping = slot_mapping
         self.context_lens = context_lens
         self.block_tables = block_tables
+        self.do_compile = do_compile
 
         self.is_prompt = len(prompt_lens) > 0
         # Set during the execution of the first attention op.
