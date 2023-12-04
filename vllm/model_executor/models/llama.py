@@ -72,9 +72,13 @@ class LlamaMLP(nn.Module):
                              "Only silu is supported for now.")
         self.act_fn = SiluAndMul()
 
-    def forward(self, x):
+    def forward(
+        self,
+        x: torch.Tensor,
+        input_metadata: InputMetadata,
+    ) -> torch.Tensor:
         gate_up, _ = self.gate_up_proj(x)
-        x = self.act_fn(gate_up)
+        x = self.act_fn(gate_up, input_metadata.do_compile)
         x, _ = self.down_proj(x)
         return x
 
@@ -150,7 +154,7 @@ class LlamaAttention(nn.Module):
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        q, k = self.rotary_emb(positions, q, k)
+        q, k = self.rotary_emb(positions, q, k, input_metadata.do_compile)
         k_cache, v_cache = kv_cache
         attn_output = self.attn(q, k, v, k_cache, v_cache, input_metadata)
         output, _ = self.o_proj(attn_output)
@@ -201,10 +205,11 @@ class LlamaDecoderLayer(nn.Module):
         # Self Attention
         if residual is None:
             residual = hidden_states
-            hidden_states = self.input_layernorm(hidden_states)
+            hidden_states = self.input_layernorm(
+                hidden_states, do_compile=input_metadata.do_compile)
         else:
             hidden_states, residual = self.input_layernorm(
-                hidden_states, residual)
+                hidden_states, residual, input_metadata.do_compile)
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
@@ -214,8 +219,8 @@ class LlamaDecoderLayer(nn.Module):
 
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(
-            hidden_states, residual)
-        hidden_states = self.mlp(hidden_states)
+            hidden_states, residual, input_metadata.do_compile)
+        hidden_states = self.mlp(hidden_states, input_metadata)
         return hidden_states, residual
 
 
@@ -258,7 +263,8 @@ class LlamaModel(nn.Module):
                 input_metadata,
                 residual,
             )
-        hidden_states, _ = self.norm(hidden_states, residual)
+        hidden_states, _ = self.norm(hidden_states, residual,
+                                     input_metadata.do_compile)
         return hidden_states
 
 
