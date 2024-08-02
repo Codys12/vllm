@@ -227,9 +227,10 @@ class OpenAIServingCompletion(OpenAIServing):
 
         try:
             async for prompt_idx, res in result_generator:
-
+                print("here")
                 # Abort the request if the client disconnects.
                 if await raw_request.is_disconnected():
+                    print("Aborting!")
                     await self.engine.abort(f"{request_id}-{prompt_idx}")
                     raise StopAsyncIteration()
 
