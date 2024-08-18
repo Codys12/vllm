@@ -609,7 +609,12 @@ class TPUModelRunner(ModelRunnerBase[ModelInputForTPU]):
                                        {next_token_id: zero_logprob}))
                 prompt_logprobs = None
                 if _ENABLE_PROMPT_LOG_PROB:
-                    prompt_logprobs = 
+                    prompt_logprobs = [None]
+                    for i, token_id in zip(prompt_token_ids[1:]):
+                        if i == 0:
+                            prompt_logprobs.append(None)
+                            continue 
+                        prompt_logprobs.append({token_id: })
                 batch_idx += 1
             else:
                 for seq_id in seq_ids:
