@@ -37,6 +37,8 @@ _ENABLE_TOP_P = False
 # This can significantly affect the performance if too large.
 _MAX_NUM_SAMPLES = 128
 
+_ENABLE_PROMPT_LOG_PROB = True
+
 
 @dataclass(frozen=True)
 class ModelInputForTPU(ModelRunnerInputBase):
@@ -48,6 +50,7 @@ class ModelInputForTPU(ModelRunnerInputBase):
     p: torch.Tensor
     num_samples: int
     best_of: List[int]
+    prompt_logprobs: List[int]
     seq_groups: List[List[int]]
     virtual_engine: int = 0
 
@@ -61,6 +64,7 @@ class ModelInputForTPU(ModelRunnerInputBase):
             "p": self.p,
             "num_samples": self.num_samples,
             "best_of": self.best_of,
+            "prompt_logprobs": self.prompt_logprobs,
             "seq_groups": self.seq_groups,
             "virtual_engine": self.virtual_engine,
         }
@@ -425,6 +429,7 @@ class TPUModelRunner(ModelRunnerBase[ModelInputForTPU]):
         t = []
         p = []
         best_of = []
+        prompt_logprobs = []
         for seq_group_metadata in seq_group_metadata_list:
             sampling_params = seq_group_metadata.sampling_params
             t.append(sampling_params.temperature)
@@ -445,19 +450,24 @@ class TPUModelRunner(ModelRunnerBase[ModelInputForTPU]):
             if sampling_params.use_beam_search:
                 raise NotImplementedError(
                     "Beam search is not supported by the TPU backend.")
-            if sampling_params.logprobs is not None:
-                raise NotImplementedError(
-                    "logprobs is not currently supported by the TPU backend.")
             if sampling_params.prompt_logprobs is not None:
-                raise NotImplementedError(
-                    "prompt_logprobs is not currently supported by the TPU "
-                    "backend.")
+                if not _ENABLE_PROMPT_LOG_PROB:
+                    raise NotImplementedError(
+                        "prompt_logprobs is not supported by the TPU backend.")
+                elif sampling_params.prompt_logprobs > 1:
+                    raise NotImplementedError(
+                        "prompt_logprobs > 1 is not supported by the TPU "
+                        "backend.")
+            prompt_logprobs.append(
+                sampling_params.prompt_logprobs if sampling_params.
+                prompt_logprobs is not None else 0)
 
             # Repeat the sampling params if the seq group has multiple seqs.
             num_seqs = len(seq_group_metadata.seq_data)
             t += [t[-1]] * (num_seqs - 1)
             p += [p[-1]] * (num_seqs - 1)
             best_of += [best_of[-1]] * (num_seqs - 1)
+            prompt_logprobs += [prompt_logprobs[-1]] * (num_seqs - 1)
 
         num_paddings = padded_batch_size - len(t)
         t += [1.0] * num_paddings
@@ -465,7 +475,7 @@ class TPUModelRunner(ModelRunnerBase[ModelInputForTPU]):
 
         t = torch.tensor(t, dtype=torch.float32, device="cpu")
         p = torch.tensor(p, dtype=torch.float32, device="cpu")
-        return t, p, best_of
+        return t, p, best_of, prompt_logprobs
 
     def prepare_model_input(
         self,
@@ -485,8 +495,8 @@ class TPUModelRunner(ModelRunnerBase[ModelInputForTPU]):
             inputs = self._prepare_decode(seq_group_metadata_list)
         input_tokens, input_positions, attn_metadata, input_lens = inputs
         padded_batch_size = input_tokens.shape[0]
-        t, p, best_of = self._prepare_sample(seq_group_metadata_list,
-                                             padded_batch_size)
+        t, p, best_of, prompt_logprobs = self._prepare_sample(
+            seq_group_metadata_list, padded_batch_size)
         num_samples = _MAX_NUM_SAMPLES if is_prompt else 1
 
         seq_groups = [
@@ -495,7 +505,7 @@ class TPUModelRunner(ModelRunnerBase[ModelInputForTPU]):
         ]
         return ModelInputForTPU(input_tokens, input_positions, attn_metadata,
                                 input_lens, t, p, num_samples, best_of,
-                                seq_groups)
+                                prompt_logprobs, seq_groups)
 
     def make_model_input_from_broadcasted_tensor_dict(
             self, tensor_dict: Dict[str, Any]) -> ModelInputForTPU:
@@ -516,27 +526,18 @@ class TPUModelRunner(ModelRunnerBase[ModelInputForTPU]):
             raise ValueError(
                 "TPUModelRunner does not support multi-step execution.")
 
-        def _execute_model(*args, clone: bool = False) -> torch.Tensor:
+        def _execute_model(*args):
             """Move input args from CPU to device and execute the model."""
-
-            def _copy_to_device(x: torch.Tensor) -> torch.Tensor:
-                if clone:
-                    # When x is a slice of a CPU tensor, XLA may copy the whole
-                    # original tensor to TPU instead of only copying x.
-                    # To avoid this, we copy x after cloning.
-                    x = x.clone()
-                return x.to(self.device)
-
             new_args = []
             for arg in args:
                 if isinstance(arg, torch.Tensor):
-                    arg = _copy_to_device(arg)
+                    arg = arg.to(self.device)
                 elif isinstance(arg, AttentionMetadata):
-                    arg.slot_mapping = _copy_to_device(arg.slot_mapping)
+                    arg.slot_mapping = arg.slot_mapping.to(self.device)
                     if getattr(arg, "block_tables", None) is not None:
-                        arg.block_tables = _copy_to_device(arg.block_tables)
+                        arg.block_tables = arg.block_tables.to(self.device)
                     if getattr(arg, "context_lens", None) is not None:
-                        arg.context_lens = _copy_to_device(arg.context_lens)
+                        arg.context_lens = arg.context_lens.to(self.device)
                 new_args.append(arg)
             return self.model(*new_args)
 
@@ -560,7 +561,7 @@ class TPUModelRunner(ModelRunnerBase[ModelInputForTPU]):
                 model_input.attn_metadata.slot_mapping = orig_slot_mapping[
                     None, start_idx:end_idx]
                 model_input.attn_metadata.num_prefills = 1
-                output_token_ids = _execute_model(
+                output_token_ids, prompt_logprobs = _execute_model(
                     model_input.token_ids[None, start_idx:end_idx],
                     model_input.position_ids[None, start_idx:end_idx],
                     model_input.attn_metadata,
@@ -568,14 +569,20 @@ class TPUModelRunner(ModelRunnerBase[ModelInputForTPU]):
                     model_input.t[i:i + 1],
                     model_input.p[i:i + 1],
                     model_input.num_samples,
-                    kv_caches,
-                    clone=True)
+                    kv_caches)
                 # Retrieve the outputs to CPU.
                 next_token_ids += output_token_ids.cpu().tolist()
+                if _ENABLE_PROMPT_LOG_PROB:
+                    logprob_indices = model_input.token_ids[
+                        start_idx:end_idx].long()
+                    logprob_indices = logprob_indices[1:].view(-1, 1)
+                    prompt_logprobs = prompt_logprobs.cpu()
+                    prompt_logprobs = prompt_logprobs[:-1].gather(
+                        1, logprob_indices)
                 start_idx = end_idx
         else:
             # Execute the model.
-            output_token_ids = _execute_model(
+            output_token_ids, _ = _execute_model(
                 model_input.token_ids, model_input.position_ids,
                 model_input.attn_metadata, model_input.input_lens,
                 model_input.t, model_input.p, model_input.num_samples,
@@ -585,7 +592,7 @@ class TPUModelRunner(ModelRunnerBase[ModelInputForTPU]):
 
         # NOTE(woosuk): Minimal code to construct the sampler outputs.
         # The TPU backend does not reuse the sampler, since the TPU backend
-        # does not support the advanced sampling parameters such as logprobs.
+        # does not support complex sampling parameters.
         zero_logprob = Logprob(0.0)
         batch_idx = 0
         sampler_outputs = []
@@ -600,6 +607,9 @@ class TPUModelRunner(ModelRunnerBase[ModelInputForTPU]):
                     seq_outputs.append(
                         SequenceOutput(seq_id, next_token_id,
                                        {next_token_id: zero_logprob}))
+                prompt_logprobs = None
+                if _ENABLE_PROMPT_LOG_PROB:
+                    prompt_logprobs = 
                 batch_idx += 1
             else:
                 for seq_id in seq_ids:
@@ -608,8 +618,9 @@ class TPUModelRunner(ModelRunnerBase[ModelInputForTPU]):
                         SequenceOutput(seq_id, next_token_id,
                                        {next_token_id: zero_logprob}))
                     batch_idx += 1
+                    prompt_logprobs = None
             sampler_outputs.append(
-                CompletionSequenceGroupOutput(seq_outputs, None))
+                CompletionSequenceGroupOutput(seq_outputs, prompt_logprobs))
         return [SamplerOutput(sampler_outputs)]
 
 
@@ -629,7 +640,7 @@ class ModelWrapper(nn.Module):
         p: torch.Tensor,
         num_samples: int,
         kv_caches: List[Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]],
-    ) -> torch.Tensor:
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Executes the forward pass of the model and samples the next token.
 
         Args:
@@ -647,7 +658,16 @@ class ModelWrapper(nn.Module):
         # Calculate the positions to sample from.
         start_indicies = torch.arange(
             batch_size, dtype=torch.int32, device=input_lens.device) * seq_len
-        logits_indices = start_indicies + input_lens - 1
+        sample_indices = start_indicies + input_lens - 1
+
+        is_prompt = attn_metadata.num_prefills > 0
+        if is_prompt and _ENABLE_PROMPT_LOG_PROB:
+            # Get the logits of the prompt.
+            logits_indices = torch.arange(batch_size * seq_len,
+                                          dtype=torch.int32,
+                                          device=input_lens.device)
+        else:
+            logits_indices = sample_indices
 
         # FIXME(woosuk): This is a temporary hack to avoid using the existing
         # sampler and sampling metadata.
@@ -688,24 +708,34 @@ class ModelWrapper(nn.Module):
         hidden_states = hidden_states.flatten(0, 1)
         logits = self.model.compute_logits(hidden_states, sampling_metadata)
 
-        # Argmax sampling.
-        argmax_token_ids = torch.argmax(logits, dim=-1, keepdim=True)
-        argmax_token_ids = argmax_token_ids.repeat(1, num_samples)
-
         # Zero temperature means greedy decoding. Avoid division by zero.
         nonzero_t = torch.where(t != 0, t, 1.0)
         logits = logits / nonzero_t.unsqueeze(dim=1)
         if _ENABLE_TOP_P:
             logits = _apply_top_p(logits, p.unsqueeze(dim=1))
 
+        if is_prompt and _ENABLE_PROMPT_LOG_PROB:
+            sample_logits = logits.index_select(0, sample_indices)
+        else:
+            sample_logits = logits
+
+        # Argmax sampling.
+        argmax_token_ids = torch.argmax(sample_logits, dim=-1, keepdim=True)
+        argmax_token_ids = argmax_token_ids.repeat(1, num_samples)
+
         # Random sampling.
-        probs = torch.softmax(logits, dim=-1, dtype=torch.float32)
+        probs = torch.softmax(sample_logits, dim=-1, dtype=torch.float32)
         sampled_token_ids = torch.multinomial(probs,
                                               num_samples,
                                               replacement=True)
         next_token_ids = torch.where(t != 0, sampled_token_ids,
                                      argmax_token_ids)
-        return next_token_ids
+
+        if is_prompt and _ENABLE_PROMPT_LOG_PROB:
+            logprobs = torch.log_softmax(logits, dim=-1, dtype=torch.float)
+            return next_token_ids, logprobs
+        else:
+            return next_token_ids, None
 
 
 def _get_padded_prefill_len(x: int) -> int:
