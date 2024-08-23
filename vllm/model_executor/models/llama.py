@@ -394,7 +394,7 @@ class LlamaForCausalLM(nn.Module, SupportsLoRA):
 
         self.config = config
         self.lora_config = lora_config
-
+        print("BRUH")
         self.model = LlamaModel(config,
                                 cache_config,
                                 quant_config,
