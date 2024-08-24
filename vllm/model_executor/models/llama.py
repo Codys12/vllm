@@ -66,13 +66,13 @@ class LlamaMLP(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
-        self.gate_proj = ColumnParallelLinear(
+        self.gate_proj = MergedColumnParallelLinear(
             input_size=hidden_size,
             output_size=intermediate_size,
             bias=bias,
             quant_config=quant_config,
             prefix=f"{prefix}.gate_proj")
-        self.up_proj = ColumnParallelLinear(
+        self.up_proj = MergedColumnParallelLinear(
             input_size=hidden_size,
             output_size=intermediate_size,
             bias=bias,
