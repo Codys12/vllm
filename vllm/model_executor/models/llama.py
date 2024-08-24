@@ -33,7 +33,7 @@ from vllm.distributed import (get_pp_group, get_tensor_model_parallel_rank,
                               get_tensor_model_parallel_world_size)
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.layernorm import RMSNorm
-from vllm.model_executor.layers.linear import (MergedColumnParallelLinear,
+from vllm.model_executor.layers.linear import (ColumnParallelLinear,
                                                QKVParallelLinear,
                                                RowParallelLinear)
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
@@ -66,13 +66,13 @@ class LlamaMLP(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
-        self.gate_proj = MergedColumnParallelLinear(
+        self.gate_proj = ColumnParallelLinear(
             input_size=hidden_size,
             output_size=intermediate_size,
             bias=bias,
             quant_config=quant_config,
             prefix=f"{prefix}.gate_proj")
-        self.up_proj = MergedColumnParallelLinear(
+        self.up_proj = ColumnParallelLinear(
             input_size=hidden_size,
             output_size=intermediate_size,
             bias=bias,
