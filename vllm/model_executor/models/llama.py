@@ -33,7 +33,7 @@ from vllm.distributed import (get_pp_group, get_tensor_model_parallel_rank,
                               get_tensor_model_parallel_world_size)
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.layernorm import RMSNorm
-from vllm.model_executor.layers.linear import (ColumnParallelLinear,
+from vllm.model_executor.layers.linear import (MergedColumnParallelLinear,
                                                QKVParallelLinear,
                                                RowParallelLinear)
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
@@ -56,6 +56,7 @@ from .utils import PPMissingLayer, is_pp_missing_parameter, make_layers
 
 
 class LlamaMLP(nn.Module):
+
     def __init__(
         self,
         hidden_size: int,
@@ -66,33 +67,25 @@ class LlamaMLP(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
-        self.gate_proj = ColumnParallelLinear(
+        self.gate_up_proj = MergedColumnParallelLinear(
             input_size=hidden_size,
-            output_size=intermediate_size,
+            output_sizes=[intermediate_size] * 2,
             bias=bias,
             quant_config=quant_config,
-            prefix=f"{prefix}.gate_proj")
-        self.up_proj = ColumnParallelLinear(
-            input_size=hidden_size,
-            output_size=intermediate_size,
-            bias=bias,
-            quant_config=quant_config,
-            prefix=f"{prefix}.up_proj")
-        self.down_proj = RowParallelLinear(
-            input_size=intermediate_size,
-            output_size=hidden_size,
-            bias=bias,
-            quant_config=quant_config,
-            prefix=f"{prefix}.down_proj")
+            prefix=f"{prefix}.gate_up_proj")
+        self.down_proj = RowParallelLinear(input_size=intermediate_size,
+                                           output_size=hidden_size,
+                                           bias=bias,
+                                           quant_config=quant_config,
+                                           prefix=f"{prefix}.down_proj")
         if hidden_act != "silu":
             raise ValueError(f"Unsupported activation: {hidden_act}. "
                              "Only silu is supported for now.")
         self.act_fn = SiluAndMul()
 
     def forward(self, x):
-        gate = self.gate_proj(x)
-        up = self.up_proj(x)
-        x = self.act_fn(gate) * up
+        gate_up, _ = self.gate_up_proj(x)
+        x = self.act_fn(gate_up)
         x, _ = self.down_proj(x)
         return x
 
@@ -394,7 +387,7 @@ class LlamaForCausalLM(nn.Module, SupportsLoRA):
 
         self.config = config
         self.lora_config = lora_config
-        print("BRUH")
+
         self.model = LlamaModel(config,
                                 cache_config,
                                 quant_config,
@@ -474,8 +467,8 @@ class LlamaForCausalLM(nn.Module, SupportsLoRA):
             (".qkv_proj", ".q_proj", "q"),
             (".qkv_proj", ".k_proj", "k"),
             (".qkv_proj", ".v_proj", "v"),
-            (".gate_proj", ".gate_proj", None), 
-            (".up_proj", ".up_proj", None), 
+            (".gate_up_proj", ".gate_proj", 0),
+            (".gate_up_proj", ".up_proj", 1),
         ]
         params_dict = dict(self.named_parameters())
         for name, loaded_weight in weights:
