@@ -97,7 +97,7 @@ class LlamaMLP(nn.Module):
         threshold, _ = torch.kthvalue(flat_abs_x, k)
         
         # Create a mask for values above the threshold
-        mask = (abs_x > threshold).float()
+        mask = (abs_x > threshold).to(x.dtype)
         
         # Apply the mask to the original tensor
         return x * mask
