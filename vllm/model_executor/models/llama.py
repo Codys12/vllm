@@ -83,8 +83,37 @@ class LlamaMLP(nn.Module):
                              "Only silu is supported for now.")
         self.act_fn = SiluAndMul()
 
+    def drop_bottom_25_percent(self, x):
+        # Compute the absolute values
+        abs_x = torch.abs(x)
+        
+        # Flatten the tensor
+        flat_abs_x = abs_x.view(-1)
+        
+        # Compute the number of elements to keep (75% of total)
+        k = int(flat_abs_x.numel() * 0.75)
+        
+        # Use torch.kthvalue to find the 25th percentile value
+        threshold, _ = torch.kthvalue(flat_abs_x, k)
+        
+        # Create a mask for values above the threshold
+        mask = (abs_x > threshold).float()
+        
+        # Apply the mask to the original tensor
+        return x * mask
+
     def forward(self, x):
         gate_up, _ = self.gate_up_proj(x)
+        
+        # Split gate_up into gate and up components
+        gate, up = torch.chunk(gate_up, 2, dim=-1)
+        
+        # Apply dropping to the gate component
+        gate = self.drop_bottom_25_percent(gate)
+        
+        # Recombine gate and up
+        gate_up = torch.cat((gate, up), dim=-1)
+        
         x = self.act_fn(gate_up)
         x, _ = self.down_proj(x)
         return x
